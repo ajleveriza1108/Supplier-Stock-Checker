@@ -67,7 +67,17 @@ class AIMemory:
 
 class OllamaAI:
     def __init__(self, model_string="qwen2.5:14b", host="http://localhost:11434"):
-        self.model = model_string.split(" ")[0].lower() if model_string else "qwen2.5:14b"
+        selected = str(model_string or "").strip()
+        if selected.lower() in {
+            "",
+            "off",
+            "regular",
+            "regular (regex)",
+            "regex",
+        }:
+            self.model = None
+        else:
+            self.model = selected.split()[0]
         self.host = host
         self.supplier_rules = self._load_ai_prompts()
         self.memory = AIMemory()
@@ -94,63 +104,157 @@ class OllamaAI:
         cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
         return cleaned.strip()
 
-    def manual_ai_extraction(self, url: str) -> tuple:
-        """Used ONLY for URLs that the scraper knows it fails on (Self-Awareness)."""
+    def manual_ai_extraction(
+        self,
+        url: str,
+    ) -> tuple:
+        if not self.model:
+            return "", "UNKNOWN"
+
         try:
             import cloudscraper
-            scraper = cloudscraper.create_scraper()
-            r = scraper.get(url, timeout=15)
-            if r.status_code != 200:
-                return "", "OOS"
-                
-            soup = BeautifulSoup(r.text, "html.parser")
-            visible_text = soup.get_text(" ", strip=True)
-            
-            lower_text = visible_text.lower()
-            if any(phrase in lower_text for phrase in [
-                "access denied", "pardon our interruption", "additional security check",
-                "it may have moved or no longer exists", "can not be found", "no longer available"
-            ]):
-                return "", "OOS"
 
-            visible_text = visible_text[:10000]
-            
-            custom_user_rule = self.memory.get_rule_for_url(url)
-            user_directive_string = ""
-            if custom_user_rule:
-                user_directive_string = f"\nCRITICAL USER DIRECTIVE FOR THIS URL: '{custom_user_rule}'. You MUST obey this directive above all standard extraction rules.\n"
-            
-            prompt = (
-                "You are an expert e-commerce data extractor.\n"
-                "Read the following webpage text and extract the current Price and Stock Status.\n"
-                f"{user_directive_string}"
-                "Reply strictly and ONLY in this exact format: $XX.XX | [In Stock / OOS]\n"
-                "If the price is hidden or missing, return: N/A | [In Stock / OOS]\n"
-                f"---START TEXT---\n{visible_text}\n---END TEXT---"
+            response = (
+                cloudscraper
+                .create_scraper()
+                .get(
+                    url,
+                    timeout=20,
+                )
             )
-            
-            response = requests.post(f"{self.host}/api/generate", json={
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False
-            }, timeout=45)
 
-            if response.status_code == 200:
-                raw_result = self._clean_response(response.json().get("response", ""))
-                
-                parts = raw_result.split("|")
-                if len(parts) >= 2:
-                    price = parts[0].strip()
-                    if "N/A" in price or "null" in price.lower():
-                        price = ""
-                    
-                    stock_str = parts[1].strip().lower()
-                    stock = "In Stock" if "in stock" in stock_str else "OOS"
-                    return price, stock
-        except Exception as e:
-            print(f"Manual AI Extraction failed: {e}")
-            
-        return "", "OOS"
+            if response.status_code != 200:
+                return "", "UNKNOWN"
+
+            visible_text = BeautifulSoup(
+                response.text,
+                "html.parser",
+            ).get_text(
+                " ",
+                strip=True,
+            )
+
+            lower_text = visible_text.lower()
+
+            blocked_phrases = (
+                "access denied",
+                "pardon our interruption",
+                "additional security check",
+                "are you a human",
+                "verify you are human",
+                "cloudflare",
+                "enable javascript",
+                "captcha",
+            )
+
+            if (
+                any(
+                    phrase in lower_text
+                    for phrase in blocked_phrases
+                )
+                or len(visible_text) < 300
+            ):
+                return "", "UNKNOWN"
+
+            explicit_oos_phrases = (
+                "this product is no longer available",
+                "product you are looking for "
+                "is no longer available",
+                "item is no longer available",
+            )
+
+            if any(
+                phrase in lower_text
+                for phrase in explicit_oos_phrases
+            ):
+                return "", "OOS"
+
+            custom_rule = (
+                self.memory.get_rule_for_url(url)
+            )
+
+            directive = ""
+
+            if custom_rule:
+                directive = (
+                    "\nUSER DIRECTIVE: "
+                    f"{custom_rule!r}. "
+                    "Follow it only when the page "
+                    "evidence supports it.\n"
+                )
+
+            prompt = (
+                "Use only the supplied page text. "
+                "Never guess.\n"
+                f"{directive}"
+                "Return exactly: PRICE | STOCK\n"
+                "STOCK must be IN STOCK, "
+                "OOS, or UNKNOWN.\n"
+                f"PAGE TEXT:\n"
+                f"{visible_text[:10000]}"
+            )
+
+            ai_response = requests.post(
+                f"{self.host}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                },
+                timeout=45,
+            )
+
+            if ai_response.status_code != 200:
+                return "", "UNKNOWN"
+
+            raw_result = self._clean_response(
+                ai_response.json().get(
+                    "response",
+                    "",
+                )
+            ).strip()
+
+            parts = [
+                part.strip()
+                for part in raw_result.split(
+                    "|",
+                    1,
+                )
+            ]
+
+            if len(parts) != 2:
+                return "", "UNKNOWN"
+
+            price_text, stock_text = parts
+            stock_upper = stock_text.upper()
+
+            if stock_upper not in {
+                "IN STOCK",
+                "OOS",
+                "UNKNOWN",
+            }:
+                return "", "UNKNOWN"
+
+            if price_text.upper() in {
+                "",
+                "N/A",
+                "NA",
+                "NONE",
+                "NULL",
+            }:
+                price_text = ""
+
+            if stock_upper == "UNKNOWN":
+                price_text = ""
+
+            return price_text, stock_upper
+
+        except Exception as exc:
+            print(
+                "Manual AI extraction failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return "", "UNKNOWN"
 
     def match_variation(self, target: str, available_options: list) -> str:
         """
@@ -225,76 +329,140 @@ class OllamaAI:
             
         return None
 
-    def verify_scrape(self, url: str, price: str, stock: str, supplier: str = "") -> bool:
-        """Acts as the 'AI Eyes' during the Suspicion Loop."""
+    def verify_scrape(
+        self,
+        url: str,
+        price: str,
+        stock: str,
+        supplier: str = "",
+    ):
+        if not self.model:
+            return None
+
         try:
             import cloudscraper
-            scraper = cloudscraper.create_scraper()
-            r = scraper.get(url, timeout=15)
-            
-            if r.status_code != 200:
-                return True 
-                
-            soup = BeautifulSoup(r.text, "html.parser")
-            visible_text = soup.get_text(" ", strip=True)
-            
+
+            response = (
+                cloudscraper
+                .create_scraper()
+                .get(
+                    url,
+                    timeout=20,
+                )
+            )
+
+            if response.status_code != 200:
+                return None
+
+            visible_text = BeautifulSoup(
+                response.text,
+                "html.parser",
+            ).get_text(
+                " ",
+                strip=True,
+            )
+
             lower_text = visible_text.lower()
-            auto_approve_phrases = [
-                "pardon our interruption", 
-                "access denied", 
-                "additional security check", 
-                "are you a human", 
+
+            blocked_phrases = (
+                "access denied",
+                "pardon our interruption",
+                "additional security check",
+                "are you a human",
+                "verify you are human",
                 "cloudflare",
                 "enable javascript",
-                "it may have moved or no longer exists",
-                "the page you are looking for can not be found",
-                "product you are looking for is no longer available"
-            ]
-            
-            if any(phrase in lower_text for phrase in auto_approve_phrases) or len(visible_text) < 300:
-                return True 
+                "captcha",
+            )
 
-            visible_text = visible_text[:10000] 
+            if (
+                any(
+                    phrase in lower_text
+                    for phrase in blocked_phrases
+                )
+                or len(visible_text) < 300
+            ):
+                return None
 
-            dynamic_rule = self.supplier_rules.get(supplier, "Evaluate standard e-commerce logic.")
-            
-            custom_user_rule = self.memory.get_rule_for_url(url)
-            user_directive_string = ""
-            if custom_user_rule:
-                user_directive_string = f"\nCRITICAL USER DIRECTIVE FOR THIS URL: '{custom_user_rule}'. You MUST obey this directive above all standard rules.\n"
+            supplier_rule = (
+                self.supplier_rules.get(
+                    supplier,
+                    "Evaluate normal "
+                    "e-commerce evidence.",
+                )
+            )
+
+            custom_rule = (
+                self.memory.get_rule_for_url(url)
+            )
+
+            directive = ""
+
+            if custom_rule:
+                directive = (
+                    "\nUSER DIRECTIVE: "
+                    f"{custom_rule!r}. "
+                    "Follow it only when "
+                    "supported by evidence.\n"
+                )
 
             prompt = (
-                f"You are an expert e-commerce data validator.\n"
-                f"Supplier-Specific Instructions: {dynamic_rule}\n"
-                f"{user_directive_string}\n"
-                f"A Regex scraper evaluated this webpage and concluded:\n"
-                f"Price: {price}\n"
-                f"Stock Status: {stock}\n\n"
-                f"Here is the raw text scraped from the webpage:\n"
-                f"---START TEXT---\n{visible_text}\n---END TEXT---\n\n"
-                f"Based purely on the text provided, is the scraper's conclusion likely correct? "
-                f"Reply with exactly 'YES' if it is correct, or 'NO' if it is obviously wrong. "
-                f"If you are unsure or the text is too messy to tell, reply 'YES'."
+                "Use only the supplied page text. "
+                "Never guess.\n"
+                f"Supplier rule: "
+                f"{supplier_rule}\n"
+                f"{directive}"
+                f"Scraper price: {price}\n"
+                f"Scraper stock: {stock}\n"
+                "Reply with exactly "
+                "YES, NO, or UNSURE.\n"
+                f"PAGE TEXT:\n"
+                f"{visible_text[:10000]}"
             )
-            
-            response = requests.post(f"{self.host}/api/generate", json={
-                "model": self.model,
-                "prompt": prompt,
-                "stream": False
-            }, timeout=45)
 
-            if response.status_code == 200:
-                raw_result = response.json().get("response", "")
-                result = self._clean_response(raw_result).upper()
-                
-                if "NO" in result and "YES" not in result:
-                    return False
-                    
-        except Exception as e:
-            print(f"Ollama Verification failed: {e}")
-        
-        return True
+            ai_response = requests.post(
+                f"{self.host}/api/generate",
+                json={
+                    "model": self.model,
+                    "prompt": prompt,
+                    "stream": False,
+                },
+                timeout=45,
+            )
 
+            if ai_response.status_code != 200:
+                return None
+
+            answer = self._clean_response(
+                ai_response.json().get(
+                    "response",
+                    "",
+                )
+            ).strip().upper()
+
+            if answer:
+                token = (
+                    answer
+                    .split(maxsplit=1)[0]
+                    .strip(".,:;!?")
+                )
+            else:
+                token = ""
+
+            if token == "YES":
+                return True
+
+            if token == "NO":
+                return False
+
+            return None
+
+        except Exception as exc:
+            print(
+                "Ollama verification failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
 
 class CaptchaSolver:
     def __init__(self, api_key=""):

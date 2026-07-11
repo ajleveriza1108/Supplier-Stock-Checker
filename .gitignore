@@ -90,3 +90,5 @@ dist/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Local repair backups
+_repair_backup_*/

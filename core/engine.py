@@ -421,7 +421,14 @@ class ScrapingEngine:
                         prefix = "[VERIFY]" if is_verify else f"[{supplier}]"
                         self.queue.put(("LOG", f"{prefix} Processing row {row_num}: {url} | Target Var: '{target_var}'", "info", None))
                         
-                        if not is_verify and self.ai_memory.is_known_problem(url):
+                        if (
+                            not is_verify
+                            and self.ai_mode not in (
+                                "OFF",
+                                "Regular (Regex)",
+                            )
+                            and self.ai_memory.is_known_problem(url)
+                        ):
                             self.queue.put(("LOG", f"[{supplier}] Memory triggered: Bypassing standard scraper for known problem URL.", "warning", url))
                             ai = OllamaAI(model_string=self.ai_mode)
                             price, stock = ai.manual_ai_extraction(url)
@@ -429,6 +436,15 @@ class ScrapingEngine:
                             title = "AI Auto-Extracted"
                             variants = [{"label": target_var or "Default", "price": price, "stock": stock}]
                             logs = [("AI manually extracted data using learned rules.", "info", url)]
+                            if str(stock).strip().upper() == "UNKNOWN":
+                                status = "Error"
+                                title = "AI Extraction Inconclusive"
+                                price = ""
+                                logs = [(
+                                    "AI extraction was inconclusive; no change accepted.",
+                                    "error",
+                                    url,
+                                )]
                             time.sleep(1) 
                         else:
                             max_retries = 3
@@ -548,7 +564,14 @@ class ScrapingEngine:
                     prefix = "[VERIFY]" if is_verify else f"[{supplier}]"
                     self.queue.put(("LOG", f"{prefix} Processing row {row_num}: {url} | Target Var: '{target_var}'", "info", None))
                    
-                    if not is_verify and self.ai_memory.is_known_problem(url):
+                    if (
+                        not is_verify
+                        and self.ai_mode not in (
+                            "OFF",
+                            "Regular (Regex)",
+                        )
+                        and self.ai_memory.is_known_problem(url)
+                    ):
                         self.queue.put(("LOG", f"[{supplier}] Memory triggered: Bypassing standard scraper for known problem URL.", "warning", url))
                         ai = OllamaAI(model_string=self.ai_mode)
                         price, stock = ai.manual_ai_extraction(url)
@@ -556,6 +579,15 @@ class ScrapingEngine:
                         title = "AI Auto-Extracted"
                         variants = [{"label": target_var or "Default", "price": price, "stock": stock}]
                         logs = [("AI manually extracted data using learned rules.", "info", url)]
+                        if str(stock).strip().upper() == "UNKNOWN":
+                            status = "Error"
+                            title = "AI Extraction Inconclusive"
+                            price = ""
+                            logs = [(
+                                "AI extraction was inconclusive; no change accepted.",
+                                "error",
+                                url,
+                            )]
                         tab_handle = None
                         if self.multi_tab_enabled and getattr(scraper, 'browser_manager', None):
                             tab_handle = scraper.browser_manager.get_new_tab()
@@ -752,21 +784,53 @@ class ScrapingEngine:
             if hasattr(self.validator, 'pending_items'):
                 self.validator.pending_items = [i for i in self.validator.pending_items if i.get('row_num') != row_num]
 
-            is_confirmed = self.validator.verify(row_num, url, price, stock, self.ai_mode, supplier=supplier)
-            
-            if not is_confirmed:
-                self.queue.put(("LOG", f"Row {row_num} - AI Disagrees! Sending to Review Window for manual final check.", "warning", url))
-                ai_status_note = "AI Rejected"
-                self.ai_memory.remember_failure(url, "AI overturned Regex false positive")
-            else:
-                self.queue.put(("LOG", f"Row {row_num} - UPDATE CONFIRMED by Suspicion Loop & AI.", "info", url))
-                ai_status_note = "AI Confirmed"
+            verification = self.validator.verify(
+                row_num,
+                url,
+                price,
+                stock,
+                self.ai_mode,
+                supplier=supplier,
+            )
+            reason = getattr(self.validator, "last_reason", "")
 
+            if verification is True:
+                self.queue.put((
+                    "LOG",
+                    f"Row {row_num} - UPDATE CONFIRMED. {reason}",
+                    "info",
+                    url,
+                ))
+                ai_status_note = "Verified"
+
+            elif verification is False:
+                self.queue.put((
+                    "LOG",
+                    f"Row {row_num} - VERIFICATION REJECTED. "
+                    f"Holding for manual review. {reason}",
+                    "warning",
+                    url,
+                ))
+                ai_status_note = "Verification Rejected"
+                self.ai_memory.remember_failure(
+                    url,
+                    reason or "Verification rejected",
+                )
+
+            else:
+                self.queue.put((
+                    "LOG",
+                    f"Row {row_num} - VERIFICATION INCONCLUSIVE. "
+                    f"Holding for manual review. {reason}",
+                    "warning",
+                    url,
+                ))
+                ai_status_note = "Verification Inconclusive"
         # ==========================================
         # PHASE 3: PAYLOAD PREPARATION
         # ==========================================
         updates = []
-        if price_changed or stock_changed or ai_status_note == "AI Rejected":
+        if price_changed or stock_changed:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             updates.append({"range": f"A{row_num}", "values": [[f"Updated: {timestamp}"]]} )
 
@@ -797,7 +861,12 @@ class ScrapingEngine:
             except Exception as e:
                 self.queue.put(("LOG", f"SQLite Cache Error: {str(e)}", "error", None))
 
-            if self.review_mode:
+            force_manual_review = ai_status_note in {
+                "Verification Rejected",
+                "Verification Inconclusive",
+            }
+
+            if self.review_mode or force_manual_review:
                 self.pending_updates = [item for item in self.pending_updates if item['row_num'] != row_num]
                 
                 self.pending_updates.append({
