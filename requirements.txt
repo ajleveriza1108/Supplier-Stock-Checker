@@ -1,0 +1,11 @@
+requests
+beautifulsoup4
+gspread
+google-auth
+cloudscraper
+selenium
+webdriver-manager
+plyer
+lxml
+customtkinter
+playwright

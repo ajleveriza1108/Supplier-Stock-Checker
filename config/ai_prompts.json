@@ -1,0 +1,15 @@
+{
+    "MN": "For Menards: The item is Out of Stock (OOS) if the page says 'It may have moved or no longer exists', 'Currently out of stock', or 'Out of stock online'. If a price is shown, prioritize the 'Final Price' or 'Sale Price'. Ignore 'Mail-in Rebate' text if it confuses the final out-of-pocket price. If the Add to Cart or Ship to Home button is missing or disabled, it is OOS.",
+    
+    "WAL": "For Walmart: The item is In Stock if there is an 'Add to cart' button. If the main item is out of stock but there is an option to 'Compare all sellers' or buy from 3rd party sellers, treat it as In Stock. Look for the main displayed price. If the page says 'Out of stock' and there are NO other sellers available, it is OOS. 'Low Stock', 'only X left', 'limited stock', 'we couldn't find this page' / 'page not found' is OOS.",
+    
+    "SG": "For Sportsman's Guide: Look specifically for the 'Buyer's Club' price, as that is the target price. If both Buyer's Club and Non-Member prices are listed, use the Buyer's Club price. Treat 'Backorder' as OOS. Ignore crossed-out MSRP prices. If you see 'See Member Price in Checkout', check only the stock, ignore the price checking.",
+    
+    "HF": "For Harbor Freight: Look for the current sale price or standard price. Ignore 'Inside Track Club' (ITC) membership prices unless it is the ONLY price available. If the item says 'In-Store Only' and cannot be shipped or added to cart online, treat it as OOS (Out of Stock) for our purposes. Ignore original crossed-out retail prices.",
+    
+    "LS": "For Lakeside Collection: The price is usually displayed clearly. If there are multiple variations, look for the main price or the specific price of the requested item. 'Low Stock' means In Stock. Only mark as OOS if it explicitly says 'Out of Stock' or 'Sold Out' and cannot be added to the cart.",
+    
+    "CE": "For Collections Etc.: Find the main sale or retail price. Ignore original crossed-out prices. If the Add to Cart button is present, it is In Stock. If it says 'Sold Out', 'Temporarily Out of Stock', or 'No longer available', mark as OOS.",
+    
+    "WEB": "For WebstaurantStore: Look for the single-item purchase price (usually the 'Buy 1' or '1+' tier). Ignore bulk discount pricing (like 'Buy 3+') unless otherwise noted. If the price says 'Log in for pricing', return N/A for price but determine stock based on the Add to Cart button. If it says 'Out of Stock', 'Discontinued', or 'Temporarily Unavailable', mark as OOS."
+}

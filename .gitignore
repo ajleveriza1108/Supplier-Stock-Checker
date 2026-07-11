@@ -1,0 +1,92 @@
+# ==================================================
+# Supplier Stock Checker
+# ==================================================
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python virtual environments
+.venv/
+.venv*/
+venv/
+venv*/
+env/
+ENV/
+
+# Project-specific virtual environment
+.venv_DESKTOP-2DIER3G/
+
+# WebDriver downloads and browser profiles
+.wdm/
+browser_profiles/
+browser-profile/
+chrome-data/
+user-data-dir/
+
+# Generated downloads and logs
+downloaded_files/
+logs/
+*.log
+
+# Runtime databases and cache
+scraper_cache.db
+*.sqlite
+*.sqlite3
+
+# Local application settings and generated state
+app_config.json
+learned_rules.json
+config/ai_memory.json
+config/crash_recovery.json
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Google credentials and authentication files
+service_account.json
+service-account.json
+credentials.json
+client_secret*.json
+token.json
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# VPN configurations, credentials, and logs
+vpn/
+*.ovpn
+
+# Temporary and backup files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+~$*
+
+# Python build and packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE and editor settings
+.vscode/
+.idea/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
