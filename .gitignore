@@ -99,3 +99,10 @@ stock_checker_source_*.zip
 auth.txt
 *.pyc
 *.db
+_repair_backup_structured_*/
+_repair_backup_walmart_visual_*/
+_repair_backup_simple_log_*/
+failed_structured_install_backup_*/
+structured_scraper_fix_*.zip
+walmart_visual_fix_*.zip
+simple_runtime_log_fix_*.zip

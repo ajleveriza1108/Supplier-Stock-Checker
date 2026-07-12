@@ -12,6 +12,11 @@ from config.settings import SUPPLIER_ORDER, SHEET_COLS, SUPPLIER_LOG_FILES
 from core.vpn_manager import SurfsharkVPN
 from core.validator import SuspicionValidator
 from core.engine_guard import EngineResultGuard
+from core.simple_runtime_log import (
+    SimpleRuntimeLogQueue,
+    format_runtime_row,
+    mark_simple_log,
+)
 
 from smart_tools import AIMemory, OllamaAI
 
@@ -32,7 +37,8 @@ class ScrapingEngine:
             except Exception:
                 pass 
 
-        self.queue = queue.Queue()
+        self.queue = SimpleRuntimeLogQueue()
+        # SIMPLE-RUNTIME-LOG:ENGINE-PATCHED
         self.is_running = False
         self.is_paused = False
         self.stop_requested = False
@@ -698,12 +704,66 @@ class ScrapingEngine:
 
 
     # STRUCTURED-SCRAPER-FIX:PROCESS-WRAPPER-BEGIN
+    # SIMPLE-RUNTIME-LOG:PROCESS-WRAPPER-BEGIN
     def process_result_item(self, item: tuple):
         supplier = item[0] if len(item) > 0 else ""
+        url = item[1] if len(item) > 1 else ""
         row_num = item[7] if len(item) > 7 else 0
         is_verify = item[9] if len(item) > 9 else False
+
         try:
-            return self._process_result_item_impl(item)
+            result = self._process_result_item_impl(item)
+
+            pending_verification = any(
+                int(entry.get("row_num", -1)) == int(row_num)
+                for entry in getattr(
+                    self.validator,
+                    "pending_items",
+                    [],
+                )
+                if isinstance(entry, dict)
+            )
+
+            if is_verify or not pending_verification:
+                pending_review = any(
+                    int(entry.get("row_num", -1)) == int(row_num)
+                    for entry in getattr(
+                        self,
+                        "pending_updates",
+                        [],
+                    )
+                    if isinstance(entry, dict)
+                )
+                summary = format_runtime_row(
+                    item,
+                    SHEET_COLS,
+                    pending_review=pending_review,
+                )
+                self.queue.put((
+                    "LOG",
+                    mark_simple_log(summary),
+                    "info",
+                    url,
+                ))
+
+            return result
+        except Exception as exc:
+            writer = getattr(
+                self.queue,
+                "write_diagnostic",
+                None,
+            )
+            if callable(writer):
+                writer(
+                    (
+                        "Simple runtime summary failed for "
+                        f"{supplier} row {row_num}: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                    "error",
+                    url,
+                )
+            raise
         finally:
             try:
                 self._mark_result_ack(
@@ -713,6 +773,7 @@ class ScrapingEngine:
                 )
             except Exception:
                 pass
+    # SIMPLE-RUNTIME-LOG:PROCESS-WRAPPER-END
     # STRUCTURED-SCRAPER-FIX:PROCESS-WRAPPER-END
 
     def _process_result_item_impl(self, item: tuple):
