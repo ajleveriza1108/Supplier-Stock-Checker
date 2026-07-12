@@ -11,6 +11,7 @@ from datetime import datetime
 from config.settings import SUPPLIER_ORDER, SHEET_COLS, SUPPLIER_LOG_FILES
 from core.vpn_manager import SurfsharkVPN
 from core.validator import SuspicionValidator
+from core.engine_guard import EngineResultGuard
 
 from smart_tools import AIMemory, OllamaAI
 
@@ -40,10 +41,14 @@ class ScrapingEngine:
         self.is_multi_thread = False
        
         self.thread_lock = threading.Lock()
+        self._result_ack_condition = threading.Condition()
+        self._result_ack_tokens = set()
         self.vpn_lock = threading.Lock()
        
         self.vpn_manager = SurfsharkVPN()
         self.validator = SuspicionValidator()
+        self.result_guard = EngineResultGuard(self.queue)
+        # STRUCTURED-SCRAPER-FIX:ENGINE-PATCHED
         self.ai_memory = AIMemory() 
        
         self.use_vpn = False
@@ -203,6 +208,51 @@ class ScrapingEngine:
                 self.vpn_manager.disconnect()
         except Exception:
             pass
+
+
+    # STRUCTURED-SCRAPER-FIX:ACK-METHODS-BEGIN
+    @staticmethod
+    def _result_ack_token(supplier, row_num, is_verify):
+        return str(supplier), int(row_num), bool(is_verify)
+
+    def _mark_result_ack(self, supplier, row_num, is_verify):
+        token = self._result_ack_token(supplier, row_num, is_verify)
+        with self._result_ack_condition:
+            self._result_ack_tokens.add(token)
+            self._result_ack_condition.notify_all()
+
+    def _wait_for_result_ack(
+        self,
+        supplier,
+        row_num,
+        is_verify,
+        timeout=180.0,
+    ):
+        token = self._result_ack_token(supplier, row_num, is_verify)
+        deadline = time.monotonic() + float(timeout)
+        with self._result_ack_condition:
+            while (
+                token not in self._result_ack_tokens
+                and not self.stop_requested
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self.queue.put((
+                        "LOG",
+                        (
+                            f"[{supplier}] Row {row_num} result acknowledgement "
+                            "timed out; continuing safely."
+                        ),
+                        "warning",
+                        None,
+                    ))
+                    return False
+                self._result_ack_condition.wait(
+                    timeout=min(remaining, 1.0)
+                )
+            self._result_ack_tokens.discard(token)
+        return not self.stop_requested
+    # STRUCTURED-SCRAPER-FIX:ACK-METHODS-END
 
     def start_check(self, retry_list=None, is_scheduled=False):
         if not (self.scrape_web_var.get() or self.scrape_wal_var.get() or self.scrape_sg_var.get() or self.scrape_hf_var.get() or self.scrape_mn_var.get() or self.scrape_ls_var.get() or self.scrape_ce_var.get()):
@@ -468,6 +518,12 @@ class ScrapingEngine:
                                 continue
                            
                         self.queue.put((supplier, url, price, stock, status, title, row, row_num, variants, is_verify))
+                        # STRUCTURED-SCRAPER-FIX:SEQUENTIAL-ORDER
+                        self._wait_for_result_ack(
+                            supplier,
+                            row_num,
+                            is_verify,
+                        )
                         self.supplier_indexes[supplier] = i + 1
                        
                         self.links_processed += 1
@@ -640,9 +696,61 @@ class ScrapingEngine:
                 if self.active_threads == 0 and not self.stop_requested:
                     self.queue.put(("COMPLETE", None))
 
+
+    # STRUCTURED-SCRAPER-FIX:PROCESS-WRAPPER-BEGIN
     def process_result_item(self, item: tuple):
+        supplier = item[0] if len(item) > 0 else ""
+        row_num = item[7] if len(item) > 7 else 0
+        is_verify = item[9] if len(item) > 9 else False
+        try:
+            return self._process_result_item_impl(item)
+        finally:
+            try:
+                self._mark_result_ack(
+                    supplier,
+                    row_num,
+                    is_verify,
+                )
+            except Exception:
+                pass
+    # STRUCTURED-SCRAPER-FIX:PROCESS-WRAPPER-END
+
+    def _process_result_item_impl(self, item: tuple):
         supplier, url, price, stock, status, title, row, row_num, variants, is_verify = item
         
+        # STRUCTURED-SCRAPER-FIX:ENGINE-GATE-BEGIN
+        decision = self.result_guard.evaluate(
+            supplier=supplier,
+            url=url,
+            row_num=row_num,
+            price=price,
+            stock=stock,
+            status=status,
+            title=title,
+            variants=variants,
+            is_verify=is_verify,
+        )
+        if not decision.accept:
+            if not is_verify:
+                self.stats['processed'] += 1
+            if decision.count_as_error:
+                self.stats['errors'] += 1
+            self.queue.put((
+                'LOG',
+                decision.message,
+                decision.tag,
+                url,
+            ))
+            self._log_to_supplier_file(
+                supplier,
+                decision.message,
+                decision.tag,
+            )
+            return
+        price = decision.price
+        stock = decision.stock
+        status = decision.status
+        # STRUCTURED-SCRAPER-FIX:ENGINE-GATE-END
         if not is_verify:
             self.stats["processed"] += 1
 
