@@ -92,3 +92,10 @@ Thumbs.db
 desktop.ini
 # Local repair backups
 _repair_backup_*/
+# Local source bundles and repair artifacts
+stock_checker_source_*.zip
+*.before_*.bak
+# Local credentials and runtime data
+auth.txt
+*.pyc
+*.db
