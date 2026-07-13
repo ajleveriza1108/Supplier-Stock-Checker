@@ -1,6 +1,16 @@
-# scrapers/walmart_policy.py
+"""Conservative Walmart verification and stock-policy resolution.
 
-"""Walmart-specific verification and stock-policy resolution."""
+This module deliberately prefers manual review over a guessed Walmart update.
+
+Rules:
+- Exact-item JSON and the rendered primary buy box must both be conclusive.
+- The raw stock states must agree exactly.
+- Low Stock, Limited Stock, and Only N Remaining are preserved as raw states;
+  the application-wide stock policy maps all three to sheet OOS.
+- Fulfillment-only OOS text never overrides an enabled primary Add to cart.
+- A normal In Stock result requires matching prices from both sources.
+- No visual or JSON source may override the other.
+"""
 
 from __future__ import annotations
 
@@ -24,15 +34,11 @@ AVAILABLE_STATES = {
     *LOW_INVENTORY_STATES,
 }
 
-STRONG_VISUAL_OOS_SCOPES = {
-    "selected_option",
-    "product",
-    "all_fulfillment",
-}
-
 
 @dataclass(slots=True)
 class WalmartObservation:
+    """One independently collected Walmart evidence source."""
+
     source: str
     stock: StockState = StockState.UNKNOWN
     price: Optional[Decimal] = None
@@ -62,12 +68,12 @@ class WalmartObservation:
                 value=self.stock.value,
                 item_id=item_id or None,
                 selector=self.selector or None,
-                confidence=self.confidence,
+                confidence=float(self.confidence or 0.0),
                 details={
                     "reason": self.reason,
-                    "exact_item_match": self.exact_item_match,
-                    "title_match": self.title_match,
-                    **self.details,
+                    "exact_item_match": bool(self.exact_item_match),
+                    "title_match": bool(self.title_match),
+                    **dict(self.details or {}),
                 },
             )
         ]
@@ -80,7 +86,7 @@ class WalmartObservation:
                     value=f"{self.price:.2f}",
                     item_id=item_id or None,
                     selector=self.selector or None,
-                    confidence=self.confidence,
+                    confidence=float(self.confidence or 0.0),
                 )
             )
 
@@ -92,7 +98,7 @@ class WalmartObservation:
                     value=str(self.quantity),
                     item_id=item_id or None,
                     selector=self.selector or None,
-                    confidence=self.confidence,
+                    confidence=float(self.confidence or 0.0),
                 )
             )
 
@@ -104,7 +110,7 @@ class WalmartObservation:
                     value=self.seller,
                     item_id=item_id or None,
                     selector=self.selector or None,
-                    confidence=self.confidence,
+                    confidence=float(self.confidence or 0.0),
                 )
             )
 
@@ -112,7 +118,7 @@ class WalmartObservation:
 
 
 class WalmartPolicy:
-    """Resolve exact-item JSON and the rendered primary buy box."""
+    """Resolve exact-item JSON and the primary rendered purchase block."""
 
     def resolve(
         self,
@@ -140,9 +146,10 @@ class WalmartPolicy:
 
         result.evidence.extend(json_observation.evidence(item_id))
         result.evidence.extend(visual_observation.evidence(item_id))
-
         result.metadata.update(
             {
+                "walmart_policy": "conservative-consensus-v1",
+                "manual_review_walmart_price_changes": True,
                 "json_reason": json_observation.reason,
                 "visual_reason": visual_observation.reason,
                 "json_text_excerpt": json_observation.text[:1200],
@@ -156,167 +163,154 @@ class WalmartPolicy:
         if error_message:
             return self._error(result, error_message)
 
-        visual_internal_conflict = bool(
-            visual_observation.details.get("internal_conflict")
-        )
-        json_internal_conflict = bool(
-            json_observation.details.get("internal_conflict")
-        )
-
-        if visual_internal_conflict:
+        if json_observation.details.get("internal_conflict"):
             return self._conflict(
                 result,
-                "The primary rendered product area contains contradictory "
-                "stock signals.",
+                "The exact-item Walmart JSON contains contradictory stock signals.",
             )
 
-        override_reason = self._strong_visual_override_reason(
-            item_id=item_id,
-            final_url=final_url,
-            json_observation=json_observation,
-            visual_observation=visual_observation,
-        )
+        if visual_observation.details.get("internal_conflict"):
+            return self._conflict(
+                result,
+                "The primary rendered Walmart purchase block contains "
+                "contradictory stock signals.",
+            )
 
-        if json_internal_conflict:
-            if override_reason:
-                return self._resolve_from_strong_visual(
-                    result=result,
+        if not json_observation.exact_item_match:
+            return self._partial(
+                result,
+                json_observation=json_observation,
+                visual_observation=visual_observation,
+                reason=(
+                    "Exact-item Walmart JSON could not be tied to the requested "
+                    f"item ID {item_id}."
+                ),
+            )
+
+        if not visual_observation.title_match:
+            return self._partial(
+                result,
+                json_observation=json_observation,
+                visual_observation=visual_observation,
+                reason=(
+                    "The rendered Walmart evidence could not be tied safely "
+                    "to the requested primary product."
+                ),
+            )
+
+        if not json_observation.conclusive or not visual_observation.conclusive:
+            missing = []
+            if not json_observation.conclusive:
+                missing.append("exact-item JSON")
+            if not visual_observation.conclusive:
+                missing.append("primary rendered buy box")
+            return self._partial(
+                result,
+                json_observation=json_observation,
+                visual_observation=visual_observation,
+                reason=(
+                    "Walmart requires two independent conclusive sources; "
+                    + " and ".join(missing)
+                    + " was inconclusive."
+                ),
+            )
+
+        if json_observation.stock != visual_observation.stock:
+            return self._conflict(
+                result,
+                (
+                    "Exact-item JSON and the primary rendered buy box disagree: "
+                    f"{json_observation.stock.value} versus "
+                    f"{visual_observation.stock.value}."
+                ),
+            )
+
+        stock = json_observation.stock
+        result.observed_stock = stock
+        result.quantity = self._agreed_quantity(
+            json_observation,
+            visual_observation,
+        )
+        result.seller = visual_observation.seller or json_observation.seller
+
+        if stock == StockState.IN_STOCK:
+            if json_observation.price is None or visual_observation.price is None:
+                return self._partial(
+                    result,
+                    json_observation=json_observation,
                     visual_observation=visual_observation,
-                    reason=override_reason,
+                    reason=(
+                        "Normal Walmart In Stock requires a price from both "
+                        "exact-item JSON and the primary rendered buy box."
+                    ),
+                    observed_stock=stock,
                 )
 
-            return self._conflict(
-                result,
-                "The exact-item JSON contains contradictory stock signals, "
-                "and the rendered product area is not strong enough to "
-                "resolve them safely.",
-            )
-
-        json_ok = json_observation.conclusive
-        visual_ok = visual_observation.conclusive
-
-        if json_ok and visual_ok:
-            if not self._stocks_compatible(
-                json_observation,
-                visual_observation,
-            ):
-                if override_reason:
-                    return self._resolve_from_strong_visual(
-                        result=result,
-                        visual_observation=visual_observation,
-                        reason=override_reason,
-                    )
-
-                return self._conflict(
-                    result,
-                    "Exact-item JSON and the primary rendered product area "
-                    f"disagree: {json_observation.stock.value} versus "
-                    f"{visual_observation.stock.value}.",
-                )
-
-            resolved_stock = self._specific_stock(
-                json_observation,
-                visual_observation,
-            )
-
-            if (
-                resolved_stock == StockState.IN_STOCK
-                and (
-                    json_observation.price is None
-                    or visual_observation.price is None
-                )
-            ):
-                result.verification = VerificationStatus.PARTIAL
-                result.observed_stock = resolved_stock
-                result.price = (
-                    visual_observation.price or json_observation.price
-                )
-                result.error_message = (
-                    "Normal In Stock requires a price from both exact-item "
-                    "JSON and the primary rendered product area."
-                )
-                result.policy_reason = result.error_message
-                return apply_stock_policy(result)
-
-            if self._price_conflict(
-                json_observation,
-                visual_observation,
+            if not self._prices_equal(
+                json_observation.price,
+                visual_observation.price,
             ):
                 return self._conflict(
                     result,
-                    "Exact-item JSON and the primary rendered product area "
-                    f"show different prices: ${json_observation.price:.2f} "
-                    f"versus ${visual_observation.price:.2f}.",
-                    observed_stock=resolved_stock,
+                    (
+                        "Exact-item JSON and the primary rendered buy box "
+                        f"show different prices: ${json_observation.price:.2f} "
+                        f"versus ${visual_observation.price:.2f}."
+                    ),
+                    observed_stock=stock,
                 )
 
-            result.verification = VerificationStatus.VERIFIED
-            result.observed_stock = resolved_stock
-            result.price = (
-                visual_observation.price or json_observation.price
-            )
-            result.quantity = (
-                visual_observation.quantity
-                if visual_observation.quantity is not None
-                else json_observation.quantity
-            )
-            result.seller = (
-                visual_observation.seller or json_observation.seller
-            )
-            result.policy_reason = (
-                "Exact-item JSON and primary rendered product evidence agree."
-            )
-            return apply_stock_policy(result)
-
-        if json_ok:
-            result.verification = VerificationStatus.PARTIAL
-            result.observed_stock = json_observation.stock
-            result.price = json_observation.price
-            result.quantity = json_observation.quantity
-            result.seller = json_observation.seller
-            result.policy_reason = (
-                "Exact-item JSON was found, but the primary rendered "
-                "product evidence could not independently confirm it."
-            )
-            return apply_stock_policy(result)
-
-        if visual_ok:
-            result.verification = VerificationStatus.PARTIAL
-            result.observed_stock = visual_observation.stock
             result.price = visual_observation.price
-            result.quantity = visual_observation.quantity
-            result.seller = visual_observation.seller
-            result.policy_reason = (
-                "Primary rendered product evidence was found, but exact-item "
-                "JSON could not independently confirm it."
+            result.metadata.update(
+                {
+                    "walmart_price_sources_agree": True,
+                    "walmart_verified_price": f"{result.price:.2f}",
+                    "walmart_price_change_requires_review": True,
+                }
             )
-            return apply_stock_policy(result)
 
-        result.verification = VerificationStatus.UNKNOWN
+        else:
+            # OOS and every low-inventory state intentionally carry no sheet
+            # price after apply_stock_policy().
+            result.price = None
+            result.metadata["walmart_price_sources_agree"] = None
+
+        result.verification = VerificationStatus.VERIFIED
         result.policy_reason = (
-            "Neither exact-item JSON nor primary rendered product evidence "
-            "produced a conclusive result."
+            "Exact-item Walmart JSON and the primary rendered buy box agree "
+            f"on {stock.value}."
         )
         return apply_stock_policy(result)
 
     @staticmethod
-    def _blocked(
-        result: ScrapeResult,
-        reason: str,
-    ) -> ScrapeResult:
+    def _prices_equal(first: Decimal, second: Decimal) -> bool:
+        return abs(first - second) <= Decimal("0.01")
+
+    @staticmethod
+    def _agreed_quantity(
+        first: WalmartObservation,
+        second: WalmartObservation,
+    ) -> Optional[int]:
+        if first.quantity is not None and second.quantity is not None:
+            return first.quantity if first.quantity == second.quantity else None
+        return (
+            first.quantity
+            if first.quantity is not None
+            else second.quantity
+        )
+
+    @staticmethod
+    def _blocked(result: ScrapeResult, reason: str) -> ScrapeResult:
         result.verification = VerificationStatus.BLOCKED
         result.error_message = reason
-        result.policy_reason = "Blocked pages cannot update the sheet."
+        result.policy_reason = "Blocked Walmart pages cannot update the sheet."
         return apply_stock_policy(result)
 
     @staticmethod
-    def _error(
-        result: ScrapeResult,
-        reason: str,
-    ) -> ScrapeResult:
+    def _error(result: ScrapeResult, reason: str) -> ScrapeResult:
         result.verification = VerificationStatus.ERROR
         result.error_message = reason
-        result.policy_reason = "Scrape error cannot update the sheet."
+        result.policy_reason = "Walmart scrape errors cannot update the sheet."
         return apply_stock_policy(result)
 
     @staticmethod
@@ -333,144 +327,32 @@ class WalmartPolicy:
         return apply_stock_policy(result)
 
     @staticmethod
-    def _strong_visual_override_reason(
-        *,
-        item_id: str,
-        final_url: str,
-        json_observation: WalmartObservation,
-        visual_observation: WalmartObservation,
-    ) -> str:
-        """
-        Allow the rendered primary buy box to resolve stale Walmart JSON.
-
-        The override remains intentionally strict. It requires:
-
-        - A conclusive visual result.
-        - No contradictory visual signals.
-        - The primary product region to be found.
-        - High-confidence visual evidence.
-        - The final URL to contain the requested Walmart item ID.
-        - An enabled Add to cart button and price for available products.
-        - Product-level OOS evidence for unavailable products.
-        """
-
-        if not visual_observation.conclusive:
-            return ""
-
-        if visual_observation.details.get("internal_conflict"):
-            return ""
-
-        if not visual_observation.title_match:
-            return ""
-
-        if float(visual_observation.confidence or 0.0) < 0.90:
-            return ""
-
-        final_url_text = str(final_url or "")
-
-        if item_id and not re.search(
-            rf"/{re.escape(str(item_id))}(?:[/?#]|$)",
-            final_url_text,
-        ):
-            return ""
-
-        json_conflicted = bool(
-            json_observation.details.get("internal_conflict")
-        )
-
-        json_stock = json_observation.stock
-        visual_stock = visual_observation.stock
-
-        if visual_stock in AVAILABLE_STATES:
-            if not visual_observation.details.get("enabled_cta"):
-                return ""
-
-            if visual_observation.price is None:
-                return ""
-
-            if json_conflicted or json_stock == StockState.OOS:
-                return (
-                    "Strong primary rendered buy-box evidence overrides "
-                    "stale or contradictory exact-item JSON: an enabled "
-                    "Add to cart control and a primary price are present."
-                )
-
-            return ""
-
-        if visual_stock == StockState.OOS:
-            if visual_observation.details.get("enabled_cta"):
-                return ""
-
-            oos_scope = str(
-                visual_observation.details.get("oos_scope") or ""
-            )
-
-            if oos_scope not in STRONG_VISUAL_OOS_SCOPES:
-                return ""
-
-            if json_conflicted or json_stock in AVAILABLE_STATES:
-                return (
-                    "Strong product-level rendered OOS evidence overrides "
-                    "stale or contradictory exact-item JSON."
-                )
-
-        return ""
-
-    @staticmethod
-    def _resolve_from_strong_visual(
-        *,
+    def _partial(
         result: ScrapeResult,
+        *,
+        json_observation: WalmartObservation,
         visual_observation: WalmartObservation,
         reason: str,
+        observed_stock: StockState = StockState.UNKNOWN,
     ) -> ScrapeResult:
-        result.verification = VerificationStatus.VERIFIED
-        result.observed_stock = visual_observation.stock
-        result.price = visual_observation.price
-        result.quantity = visual_observation.quantity
-        result.seller = visual_observation.seller
-        result.policy_reason = reason
-
-        result.metadata.update(
-            {
-                "resolved_by_visual_override": True,
-                "visual_override_reason": reason,
-                "visual_override_scope": str(
-                    visual_observation.details.get("oos_scope") or ""
-                ),
-            }
+        result.verification = VerificationStatus.PARTIAL
+        result.observed_stock = observed_stock
+        result.price = visual_observation.price or json_observation.price
+        result.quantity = (
+            visual_observation.quantity
+            if visual_observation.quantity is not None
+            else json_observation.quantity
         )
-
+        result.seller = visual_observation.seller or json_observation.seller
+        result.error_message = reason
+        result.policy_reason = reason
         return apply_stock_policy(result)
-
-    @staticmethod
-    def _stocks_compatible(
-        json_observation: WalmartObservation,
-        visual_observation: WalmartObservation,
-    ) -> bool:
-        first = json_observation.stock
-        second = visual_observation.stock
-
-        if first == second:
-            return True
-
-        if first in AVAILABLE_STATES and second in AVAILABLE_STATES:
-            return True
-
-        if (
-            first in LOW_INVENTORY_STATES
-            and second == StockState.OOS
-        ):
-            return str(
-                visual_observation.details.get("oos_scope") or ""
-            ) in STRONG_VISUAL_OOS_SCOPES
-
-        return False
 
     @staticmethod
     def classify_rendered_signals(
         signals: dict[str, Any],
     ) -> tuple[StockState, Optional[int], str, bool, str]:
-        """Classify stock evidence from the primary product area."""
+        """Classify only the requested item's primary rendered purchase block."""
 
         if not signals.get("regionFound"):
             return (
@@ -478,57 +360,52 @@ class WalmartPolicy:
                 None,
                 str(
                     signals.get("reason")
-                    or "Primary product region not found."
+                    or "Primary Walmart purchase region was not found."
                 ),
+                False,
+                "",
+            )
+
+        if not signals.get("exactItemAnchor"):
+            return (
+                StockState.UNKNOWN,
+                None,
+                "Rendered purchase evidence was not anchored to the requested item.",
                 False,
                 "",
             )
 
         enabled_cta = bool(signals.get("enabledCta"))
         disabled_cta = bool(signals.get("disabledCta"))
-        selected_option_oos = bool(
-            signals.get("selectedOptionOos")
-        )
+        selected_option_oos = bool(signals.get("selectedOptionOos"))
         product_oos = bool(signals.get("productOos"))
-        inventory_text = str(
-            signals.get("inventoryText") or ""
-        )
+        inventory_text = str(signals.get("inventoryText") or "")
         fulfillment = signals.get("fulfillment") or {}
 
-        states: list[str] = []
-
+        fulfillment_states: list[str] = []
         if isinstance(fulfillment, dict):
             for value in fulfillment.values():
                 if isinstance(value, dict):
-                    state = str(
-                        value.get("state") or "UNKNOWN"
-                    ).upper()
+                    state = str(value.get("state") or "UNKNOWN").upper()
                 else:
-                    state = str(
-                        value or "UNKNOWN"
-                    ).upper()
+                    state = str(value or "UNKNOWN").upper()
+                if state in {"AVAILABLE", "UNAVAILABLE", "UNKNOWN"}:
+                    fulfillment_states.append(state)
 
-                if state in {
-                    "AVAILABLE",
-                    "UNAVAILABLE",
-                    "UNKNOWN",
-                }:
-                    states.append(state)
-
-        available_methods = states.count("AVAILABLE")
-        unavailable_methods = states.count("UNAVAILABLE")
+        available_methods = fulfillment_states.count("AVAILABLE")
+        unavailable_methods = fulfillment_states.count("UNAVAILABLE")
 
         if enabled_cta:
-            if selected_option_oos:
+            if selected_option_oos or product_oos:
                 return (
                     StockState.UNKNOWN,
                     None,
                     (
                         "The primary Add to cart control is enabled, but the "
-                        "page also says the selected option is out of stock."
+                        "same primary purchase block also reports product OOS."
                     ),
                     True,
-                    "selected_option",
+                    "product",
                 )
 
             stock, quantity = parse_inventory_detail(
@@ -537,23 +414,13 @@ class WalmartPolicy:
             )
 
             if stock == StockState.QUANTITY_REMAINING:
-                reason = (
-                    f"Enabled primary Add to cart; only "
-                    f"{quantity} remaining."
-                )
+                reason = f"Primary buy box reports only {quantity} remaining."
             elif stock == StockState.LOW_STOCK:
-                reason = (
-                    "Enabled primary Add to cart; page reports Low Stock."
-                )
+                reason = "Primary buy box reports Low Stock."
             elif stock == StockState.LIMITED_STOCK:
-                reason = (
-                    "Enabled primary Add to cart; page reports "
-                    "Limited Stock."
-                )
+                reason = "Primary buy box reports Limited Stock."
             else:
-                reason = (
-                    "Enabled primary product Add to cart control."
-                )
+                reason = "Enabled primary Add to cart control."
 
             return stock, quantity, reason, False, ""
 
@@ -570,17 +437,14 @@ class WalmartPolicy:
             return (
                 StockState.OOS,
                 None,
-                (
-                    "The primary product purchase area explicitly reports "
-                    "Out of stock."
-                ),
+                "The primary product purchase block explicitly reports OOS.",
                 False,
                 "product",
             )
 
         if (
-            len(states) >= 2
-            and unavailable_methods == len(states)
+            len(fulfillment_states) >= 2
+            and unavailable_methods == len(fulfillment_states)
             and available_methods == 0
         ):
             return (
@@ -597,7 +461,7 @@ class WalmartPolicy:
                 None,
                 (
                     "The primary Add to cart control is disabled without "
-                    "enough product-level OOS evidence."
+                    "independent product-level OOS evidence."
                 ),
                 False,
                 "",
@@ -615,52 +479,25 @@ class WalmartPolicy:
                 "",
             )
 
+        if unavailable_methods:
+            return (
+                StockState.UNKNOWN,
+                None,
+                (
+                    "One fulfillment method is unavailable, but that alone "
+                    "does not prove whole-product OOS."
+                ),
+                False,
+                "",
+            )
+
         return (
             StockState.UNKNOWN,
             None,
-            "Rendered primary product evidence was inconclusive.",
+            "Primary rendered Walmart evidence was inconclusive.",
             False,
             "",
         )
-
-    @staticmethod
-    def _specific_stock(
-        first: WalmartObservation,
-        second: WalmartObservation,
-    ) -> StockState:
-        priority = (
-            StockState.QUANTITY_REMAINING,
-            StockState.LOW_STOCK,
-            StockState.LIMITED_STOCK,
-            StockState.IN_STOCK,
-            StockState.OOS,
-        )
-
-        states = {
-            first.stock,
-            second.stock,
-        }
-
-        for stock in priority:
-            if stock in states:
-                return stock
-
-        return StockState.UNKNOWN
-
-    @staticmethod
-    def _price_conflict(
-        first: WalmartObservation,
-        second: WalmartObservation,
-    ) -> bool:
-        if not first.is_available or not second.is_available:
-            return False
-
-        if first.price is None or second.price is None:
-            return False
-
-        return abs(
-            first.price - second.price
-        ) > Decimal("0.01")
 
 
 def parse_inventory_detail(
@@ -669,7 +506,7 @@ def parse_inventory_detail(
     quantity: Optional[int] = None,
     available: bool = True,
 ) -> tuple[StockState, Optional[int]]:
-    """Return the most specific available inventory state in text."""
+    """Return the most specific selected-item inventory state."""
 
     normalized = re.sub(
         r"\s+",
@@ -684,12 +521,8 @@ def parse_inventory_detail(
         r"\bonly\s+(\d+)\s+(?:left|remaining|in stock)\b",
         normalized,
     )
-
     if match:
-        return (
-            StockState.QUANTITY_REMAINING,
-            int(match.group(1)),
-        )
+        return StockState.QUANTITY_REMAINING, int(match.group(1))
 
     if "low stock" in normalized:
         return StockState.LOW_STOCK, quantity

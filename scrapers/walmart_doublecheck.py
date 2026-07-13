@@ -1,8 +1,10 @@
-"""Walmart verification-pass scraper.
+"""Compatibility wrapper for the conservative Walmart scraper.
 
-This class intentionally inherits all extraction, verification, business
-policy, and structured logging from :mod:`scrapers.walmart`.  The only
-difference is a longer render window for second-pass checks.
+The engine historically replaces the configured ``WAL`` scraper with
+``WalmartDoubleCheckScraper``.  Keeping a second independent implementation
+caused fixes in ``scrapers/walmart.py`` to be bypassed.  This wrapper now uses
+the same exact-item consensus implementation so Walmart has one source of
+truth.
 """
 
 from __future__ import annotations
@@ -11,17 +13,6 @@ from scrapers.walmart import WalmartScraper
 
 
 class WalmartDoubleCheckScraper(WalmartScraper):
-    def __init__(
-        self,
-        browser_manager=None,
-        logger_func=None,
-        **kwargs,
-    ) -> None:
-        super().__init__(
-            browser_manager=browser_manager,
-            logger_func=logger_func,
-            render_timeout=18,
-            post_ready_delay=2.5,
-            log_prefix="WAL-DC",
-            **kwargs,
-        )
+    """Backward-compatible name for the single Walmart implementation."""
+
+    pass

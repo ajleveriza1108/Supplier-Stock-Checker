@@ -1,9 +1,9 @@
-"""Walmart scraper with exact-item JSON and primary-rendered-area consensus.
+"""Walmart scraper with conservative exact-item consensus.
 
-The scraper keeps the application's six-value tuple interface, but every
-Walmart result also carries structured verification metadata in the first
-variant dictionary.  The engine guard permits updates only when JSON and
-rendered primary-product evidence agree.
+The scraper keeps the application's six-value tuple interface. Every
+Walmart result carries structured verification metadata. Exact-item JSON
+and the requested item's primary rendered purchase block must agree; any
+missing or conflicting evidence is held for manual review.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ from scrapers.walmart_policy import (
 )
 
 
-WALMART_VISUAL_FIX_VERSION = "2026.07.13.2"
+WALMART_VISUAL_FIX_VERSION = "2026.07.13.5"
 
 
 class WalmartScraper(BaseScraper):
@@ -145,7 +145,7 @@ class WalmartScraper(BaseScraper):
                 logs=output_logs,
             )
 
-        self._wait_for_product_page(driver)
+        self._wait_for_product_page(driver, item_id=item_id)
 
         try:
             html = driver.page_source or ""
@@ -191,6 +191,7 @@ class WalmartScraper(BaseScraper):
             visual_observation = self._visual_observation(
                 driver=driver,
                 title=title,
+                item_id=item_id,
             )
         except Exception as exc:
             visual_observation = WalmartObservation(
@@ -254,12 +255,18 @@ class WalmartScraper(BaseScraper):
         with self._result_lock:
             return self._last_results.get(url)
 
-    def _wait_for_product_page(self, driver) -> None:
-        """Wait for Walmart's asynchronously rendered purchase state.
+    def _wait_for_product_page(
+        self,
+        driver,
+        *,
+        item_id: str,
+    ) -> None:
+        """Wait for the requested item's primary purchase area.
 
-        Walmart often renders the heading before the buy box. Reading the
-        page too early can miss an enabled Add to cart button while still
-        seeing a fulfillment-specific or stale out-of-stock message.
+        Walmart frequently renders recommendation cards before the selected
+        product buy box is complete.  Waiting for any Add button or any price
+        can therefore lock onto another item.  This wait requires the current
+        URL item ID and a primary product anchor.
         """
 
         try:
@@ -272,19 +279,9 @@ class WalmartScraper(BaseScraper):
         except (TimeoutException, WebDriverException):
             pass
 
-        try:
-            WebDriverWait(driver, self.render_timeout).until(
-                lambda current: bool(
-                    current.find_elements(
-                        By.CSS_SELECTOR,
-                        "h1, script#__NEXT_DATA__, main",
-                    )
-                )
-            )
-        except (TimeoutException, WebDriverException):
-            pass
+        ready_script = r"""
+            const targetId = String(arguments[0] || "");
 
-        purchase_ready_script = r"""
             function visible(el) {
                 if (!el) return false;
                 const style = window.getComputedStyle(el);
@@ -292,61 +289,68 @@ class WalmartScraper(BaseScraper):
                 return style.display !== "none" &&
                        style.visibility !== "hidden" &&
                        Number(style.opacity || "1") > 0 &&
-                       rect.width > 1 && rect.height > 1;
+                       rect.width > 1 &&
+                       rect.height > 1;
             }
 
-            function label(el) {
-                return [
-                    el.innerText || el.textContent || "",
-                    el.getAttribute("aria-label") || "",
-                    el.getAttribute("title") || "",
-                    el.getAttribute("value") || "",
-                    el.getAttribute("data-automation-id") || "",
-                    el.getAttribute("data-testid") || ""
-                ].join(" " ).replace(/\s+/g, " " ).trim().toLowerCase();
+            function text(el) {
+                return (el && (el.innerText || el.textContent) || "")
+                    .replace(/\s+/g, " ")
+                    .trim();
             }
 
-            const controls = Array.from(document.querySelectorAll(
-                "button,[role='button'],input[type='button']," +
-                "input[type='submit'],[data-automation-id*='add-to-cart']," +
-                "[data-testid*='add-to-cart']"
-            )).filter(visible);
+            function itemIdFromUrl(value) {
+                const match = String(value || "").match(
+                    /\/ip\/(?:[^/?#]+\/)?(\d+)(?:[/?#]|$)/i
+                );
+                return match ? match[1] : "";
+            }
 
-            const hasCart = controls.some(el => {
-                const text = label(el);
-                return text.includes("add to cart") ||
-                       text.includes("add to basket") ||
-                       text.includes("add to bag");
+            const currentId = itemIdFromUrl(window.location.href);
+            if (targetId && currentId && currentId !== targetId) {
+                return false;
+            }
+
+            const h1 = Array.from(document.querySelectorAll("h1"))
+                .find(el => visible(el) && text(el).length > 2);
+            if (!h1) return false;
+
+            const headingY = h1.getBoundingClientRect().top + window.scrollY;
+            const anchors = Array.from(
+                document.querySelectorAll("div,span,p")
+            ).filter(el => {
+                if (!visible(el)) return false;
+                const value = text(el).toLowerCase();
+                const y = el.getBoundingClientRect().top + window.scrollY;
+                return value === "price when purchased online" &&
+                       y >= headingY - 50 &&
+                       y <= headingY + 1600;
             });
 
-            const statusNodes = Array.from(document.querySelectorAll(
-                "main div,main span,main p,main button"
-            )).filter(visible);
-            const hasStandaloneOos = statusNodes.some(el => {
-                const text = (el.innerText || el.textContent || "")
-                    .replace(/\s+/g, " " ).trim().toLowerCase();
-                return /^(?:this item is )?(?:out of stock|sold out|currently unavailable|unavailable)[.!]?$/.test(text);
+            if (anchors.length) return true;
+
+            const primaryStatuses = Array.from(
+                document.querySelectorAll("main div,main span,main p")
+            ).filter(visible).some(el => {
+                const value = text(el).toLowerCase();
+                const y = el.getBoundingClientRect().top + window.scrollY;
+                return y >= headingY - 50 &&
+                       y <= headingY + 1200 &&
+                       /^(?:this item is )?(?:out of stock|sold out|currently unavailable|unavailable|not available|no longer available)[.!]?$/
+                           .test(value);
             });
 
-            const hasPrice = Array.from(document.querySelectorAll(
-                '[data-automation-id="product-price"],' +
-                '[data-testid="product-price"],' +
-                '[data-testid*="product-price"],' +
-                '[data-testid="price-wrap"]'
-            )).some(visible);
-
-            return Boolean(hasCart || hasStandaloneOos || hasPrice);
+            return primaryStatuses;
         """
 
         try:
             WebDriverWait(driver, self.render_timeout).until(
                 lambda current: bool(
-                    current.execute_script(purchase_ready_script)
+                    current.execute_script(ready_script, item_id)
                 )
             )
         except (TimeoutException, WebDriverException):
-            # The policy will keep an inconclusive page out of automatic
-            # sheet updates.
+            # The policy will return PARTIAL/UNKNOWN instead of guessing.
             pass
 
         if self.post_ready_delay:
@@ -463,26 +467,25 @@ class WalmartScraper(BaseScraper):
         *,
         driver,
         title: str,
+        item_id: str,
     ) -> WalmartObservation:
-        """Read the rendered primary product area without using JSON hints.
-
-        The visual pass deliberately does not receive the JSON price.  It
-        independently identifies the page's primary product region, its
-        product-level price, the main Add to cart control, selected-option
-        availability, and each fulfillment method.  A single unavailable
-        fulfillment method must never make the whole product OOS.
-        """
+        """Read only the requested item's primary rendered purchase block."""
 
         script = r"""
-            const title = (arguments[0] || "").trim();
+            const title = String(arguments[0] || "").trim();
+            const targetId = String(arguments[1] || "").trim();
+            const priceRegex =
+                /\$\s*([0-9]{1,7}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/g;
+
             const badTokens = [
                 "carousel", "recommend", "related", "sponsor",
                 "search-result", "searchresult", "similar",
-                "recently-viewed", "product-card", "shelf",
-                "review", "feedback", "footer", "header",
-                "protection-plan", "warranty", "ad-container"
+                "recently-viewed", "product-card", "product-tile",
+                "product-grid", "shelf", "review", "feedback",
+                "footer", "header", "protection-plan", "warranty",
+                "ad-container", "more-seller", "other-seller",
+                "seller-offer"
             ];
-            const priceRegex = /\$\s*([0-9]{1,7}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)/g;
 
             function visible(el) {
                 if (!el) return false;
@@ -491,12 +494,28 @@ class WalmartScraper(BaseScraper):
                 return style.display !== "none" &&
                        style.visibility !== "hidden" &&
                        Number(style.opacity || "1") > 0 &&
-                       rect.width > 1 && rect.height > 1;
+                       rect.width > 1 &&
+                       rect.height > 1;
             }
 
             function pageY(el) {
-                const rect = el.getBoundingClientRect();
-                return rect.top + window.scrollY;
+                return el.getBoundingClientRect().top + window.scrollY;
+            }
+
+            function ownText(el) {
+                return (el && (el.innerText || el.textContent) || "")
+                    .replace(/\s+/g, " ")
+                    .trim();
+            }
+
+            function directText(el) {
+                if (!el) return "";
+                return Array.from(el.childNodes || [])
+                    .filter(node => node.nodeType === Node.TEXT_NODE)
+                    .map(node => node.textContent || "")
+                    .join(" ")
+                    .replace(/\s+/g, " ")
+                    .trim();
             }
 
             function descriptors(el) {
@@ -507,61 +526,9 @@ class WalmartScraper(BaseScraper):
                     el.getAttribute("data-testid") || "",
                     el.getAttribute("data-automation-id") || "",
                     el.getAttribute("aria-label") || "",
-                    el.getAttribute("role") || ""
+                    el.getAttribute("role") || "",
+                    el.tagName || ""
                 ].join(" ").toLowerCase();
-            }
-
-            function hasBadAncestor(el) {
-                let current = el;
-                for (let i = 0; current && i < 10; i++, current = current.parentElement) {
-                    const desc = descriptors(current);
-                    if (badTokens.some(token => desc.includes(token))) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-
-            function ownText(el) {
-                if (!el) return "";
-                return (el.innerText || el.textContent || "")
-                    .replace(/\s+/g, " ")
-                    .trim();
-            }
-
-            function directText(el) {
-                if (!el) return "";
-                return Array.from(el.childNodes || [])
-                    .filter(node => node.nodeType === Node.TEXT_NODE)
-                    .map(node => node.textContent || "")
-                    .join(" " )
-                    .replace(/\s+/g, " " )
-                    .trim();
-            }
-
-            function hasTokenAncestor(el, tokens, maxDepth = 8) {
-                let current = el;
-                for (let i = 0; current && i < maxDepth; i++, current = current.parentElement) {
-                    const desc = descriptors(current);
-                    if (tokens.some(token => desc.includes(token))) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-
-            function parsePrices(raw) {
-                const values = [];
-                const text = String(raw || "");
-                let match;
-                priceRegex.lastIndex = 0;
-                while ((match = priceRegex.exec(text)) !== null) {
-                    const value = parseFloat(match[1].replace(/,/g, ""));
-                    if (Number.isFinite(value) && value >= 0.01 && value <= 1000000) {
-                        values.push(value);
-                    }
-                }
-                return values;
             }
 
             function normalizedLabel(el) {
@@ -570,7 +537,8 @@ class WalmartScraper(BaseScraper):
                     el.getAttribute("aria-label") || "",
                     el.getAttribute("title") || "",
                     el.getAttribute("value") || "",
-                    el.getAttribute("data-automation-id") || ""
+                    el.getAttribute("data-automation-id") || "",
+                    el.getAttribute("data-testid") || ""
                 ].join(" ").replace(/\s+/g, " ").trim().toLowerCase();
             }
 
@@ -580,62 +548,195 @@ class WalmartScraper(BaseScraper):
                     descriptors(el).includes("disabled");
             }
 
+            function itemIdFromUrl(value) {
+                const match = String(value || "").match(
+                    /\/ip\/(?:[^/?#]+\/)?(\d+)(?:[/?#]|$)/i
+                );
+                return match ? match[1] : "";
+            }
+
+            function parsePrices(raw) {
+                const output = [];
+                const value = String(raw || "");
+                priceRegex.lastIndex = 0;
+                let match;
+                while ((match = priceRegex.exec(value)) !== null) {
+                    const amount = parseFloat(match[1].replace(/,/g, ""));
+                    if (
+                        Number.isFinite(amount) &&
+                        amount >= 0.01 &&
+                        amount <= 1000000
+                    ) {
+                        output.push(amount);
+                    }
+                }
+                return output;
+            }
+
+            function hasTokenAncestor(el, tokens, maxDepth = 9) {
+                let current = el;
+                for (
+                    let depth = 0;
+                    current && depth < maxDepth;
+                    depth++, current = current.parentElement
+                ) {
+                    const desc = descriptors(current);
+                    if (tokens.some(token => desc.includes(token))) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            function belongsToDifferentItem(el) {
+                if (!el || !targetId) return false;
+
+                const closestLink = el.closest("a[href*='/ip/']");
+                if (closestLink) {
+                    const linkedId = itemIdFromUrl(
+                        closestLink.getAttribute("href") || closestLink.href
+                    );
+                    if (linkedId && linkedId !== targetId) return true;
+                }
+
+                let current = el;
+                for (
+                    let depth = 0;
+                    current &&
+                    current !== document.body &&
+                    current !== document.documentElement &&
+                    depth < 9;
+                    depth++, current = current.parentElement
+                ) {
+                    const desc = descriptors(current);
+                    const tag = String(current.tagName || "").toLowerCase();
+                    const cardLike =
+                        tag === "li" ||
+                        tag === "article" ||
+                        /product[-_ ]?(card|tile|item)|carousel|shelf|recommend|related|sponsored/
+                            .test(desc);
+
+                    if (!cardLike) continue;
+
+                    const ids = Array.from(
+                        current.querySelectorAll("a[href*='/ip/']")
+                    ).map(link => itemIdFromUrl(
+                        link.getAttribute("href") || link.href
+                    )).filter(Boolean);
+
+                    if (ids.length && !ids.includes(targetId)) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            function hasBadAncestor(el) {
+                let current = el;
+                for (
+                    let depth = 0;
+                    current &&
+                    current !== document.body &&
+                    current !== document.documentElement &&
+                    depth < 10;
+                    depth++, current = current.parentElement
+                ) {
+                    const desc = descriptors(current);
+                    if (badTokens.some(token => desc.includes(token))) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            const currentItemId = itemIdFromUrl(window.location.href);
+            const currentItemMatch =
+                !targetId || !currentItemId || currentItemId === targetId;
+
             const h1 = Array.from(document.querySelectorAll("h1"))
                 .find(el => visible(el) && ownText(el).length > 2) || null;
-            if (!h1) {
+
+            if (!h1 || !currentItemMatch) {
                 return {
                     regionFound: false,
-                    reason: "No visible primary product heading was found."
+                    exactItemAnchor: false,
+                    reason: !currentItemMatch
+                        ? "The rendered page URL does not match the requested item ID."
+                        : "No visible primary product heading was found."
                 };
             }
 
             const headingY = pageY(h1);
             const stopLabels = [
-                "about this item", "product details", "similar items",
-                "customers also considered", "continue your search",
-                "frequently bought together"
+                "about this item", "product details",
+                "similar items", "similar items you might like",
+                "based on what customers bought",
+                "customers also considered", "customers also bought",
+                "you may also like", "recommended for you",
+                "related products", "sponsored products",
+                "continue your search", "frequently bought together",
+                "more seller options", "compare all sellers",
+                "other sellers"
             ];
+
             const stopHeadings = Array.from(
                 document.querySelectorAll("h2,h3,[role='heading']")
             ).filter(el => {
                 if (!visible(el)) return false;
                 const y = pageY(el);
-                if (y <= headingY + 250) return false;
+                if (y <= headingY + 220) return false;
                 const label = ownText(el).toLowerCase();
                 return stopLabels.some(stop => label.startsWith(stop));
             }).sort((a, b) => pageY(a) - pageY(b));
 
             const regionTop = Math.max(0, headingY - 120);
-            const naturalBottom = stopHeadings.length
-                ? pageY(stopHeadings[0]) - 8
-                : headingY + 2600;
-            const regionBottom = Math.min(naturalBottom, headingY + 3000);
+            const regionBottom = Math.min(
+                stopHeadings.length ? pageY(stopHeadings[0]) - 8 : headingY + 1800,
+                headingY + 1800
+            );
 
-            function inRegion(el) {
-                if (!el || !visible(el) || hasBadAncestor(el)) return false;
+            function inMainRegion(el) {
+                if (
+                    !el ||
+                    !visible(el) ||
+                    hasBadAncestor(el) ||
+                    belongsToDifferentItem(el)
+                ) {
+                    return false;
+                }
                 const y = pageY(el);
                 return y >= regionTop && y <= regionBottom;
             }
 
-            const allControls = Array.from(document.querySelectorAll(
-                "button,[role='button'],input[type='button'],input[type='submit']," +
-                "[data-automation-id*='add-to-cart'],[data-testid*='add-to-cart']"
-            )).filter(inRegion);
-
-            const addControls = allControls.filter(el => {
-                const label = normalizedLabel(el);
-                return label.includes("add to cart") ||
-                       label.includes("add to basket") ||
-                       label.includes("add to bag");
+            const purchaseAnchors = Array.from(
+                document.querySelectorAll("div,span,p")
+            ).filter(el => {
+                if (!inMainRegion(el)) return false;
+                const value = (directText(el) || ownText(el)).toLowerCase();
+                const y = pageY(el);
+                return value === "price when purchased online" &&
+                       y >= headingY - 50 &&
+                       y <= headingY + 1500;
             }).sort((a, b) => pageY(a) - pageY(b));
 
-            const enabledAdd = addControls.find(el => !disabled(el)) || null;
-            const disabledAdd = addControls.find(el => disabled(el)) || null;
-            const cartAnchorY = enabledAdd
-                ? pageY(enabledAdd)
-                : disabledAdd
-                ? pageY(disabledAdd)
-                : headingY + 900;
+            const purchaseAnchor = purchaseAnchors[0] || null;
+            if (!purchaseAnchor) {
+                return {
+                    regionFound: true,
+                    exactItemAnchor: false,
+                    reason: "Primary 'Price when purchased online' anchor was not found."
+                };
+            }
+
+            const anchorY = pageY(purchaseAnchor);
+            const purchaseTop = Math.max(regionTop, anchorY - 430);
+            const purchaseBottom = Math.min(regionBottom, anchorY + 900);
+
+            function inPurchaseWindow(el) {
+                if (!inMainRegion(el)) return false;
+                const y = pageY(el);
+                return y >= purchaseTop && y <= purchaseBottom;
+            }
 
             const priceSelectors = [
                 '[data-automation-id="product-price"]',
@@ -645,43 +746,45 @@ class WalmartScraper(BaseScraper):
                 '[itemprop="price"]',
                 'meta[itemprop="price"]'
             ];
+
             const priceCandidates = [];
             const seenPriceNodes = new Set();
 
-            for (let priority = 0; priority < priceSelectors.length; priority++) {
-                const selector = priceSelectors[priority];
+            for (
+                let selectorPriority = 0;
+                selectorPriority < priceSelectors.length;
+                selectorPriority++
+            ) {
+                const selector = priceSelectors[selectorPriority];
                 for (const node of document.querySelectorAll(selector)) {
                     if (seenPriceNodes.has(node)) continue;
                     seenPriceNodes.add(node);
-                    if (node.tagName !== "META" && !inRegion(node)) continue;
-                    if (node.tagName === "META") {
-                        const parent = node.parentElement;
-                        if (parent && !inRegion(parent)) continue;
-                    }
-                    const desc = descriptors(node);
+
+                    const anchorNode =
+                        node.tagName === "META" && node.parentElement
+                            ? node.parentElement
+                            : node;
+
+                    if (!inPurchaseWindow(anchorNode)) continue;
+                    if (belongsToDifferentItem(anchorNode)) continue;
+
+                    const y = pageY(anchorNode);
+                    if (y < anchorY - 430 || y > anchorY + 80) continue;
+
                     if (
-                        desc.includes("was-price") ||
-                        desc.includes("strike") ||
-                        desc.includes("comparison") ||
-                        desc.includes("unit-price") ||
-                        desc.includes("protection")
+                        hasTokenAncestor(
+                            anchorNode,
+                            ["variant", "swatch", "option", "choice"],
+                            8
+                        )
                     ) {
                         continue;
                     }
 
-                    const anchorNode = (
-                        node.tagName === "META" && node.parentElement
-                    ) ? node.parentElement : node;
-                    const candidateY = pageY(anchorNode);
-                    const inVariantPriceArea = hasTokenAncestor(
-                        anchorNode,
-                        ["variant", "swatch", "option", "choice"],
-                        8
-                    );
+                    const desc = descriptors(node);
                     if (
-                        inVariantPriceArea ||
-                        candidateY < headingY - 60 ||
-                        candidateY > cartAnchorY + 240
+                        /was-price|strike|comparison|unit-price|protection|installment|affirm|klarna|afterpay|seller-offer|other-seller/
+                            .test(desc)
                     ) {
                         continue;
                     }
@@ -689,111 +792,145 @@ class WalmartScraper(BaseScraper):
                     const raw = [
                         node.getAttribute("content") || "",
                         node.getAttribute("aria-label") || "",
+                        node.getAttribute("title") || "",
                         ownText(node)
                     ].join(" ");
+
                     const values = parsePrices(raw);
                     if (!values.length) continue;
+
+                    const lower = raw.toLowerCase();
+                    let priority = selectorPriority + 5;
+                    if (lower.includes("current price")) priority -= 5;
+                    if (
+                        desc.includes("product-price") ||
+                        desc.includes("product_price")
+                    ) {
+                        priority -= 3;
+                    }
+                    if (
+                        lower.includes("was $") &&
+                        !lower.includes("current price")
+                    ) {
+                        priority += 15;
+                    }
+
                     priceCandidates.push({
                         value: values[0],
                         priority,
-                        y: candidateY,
+                        y,
+                        distance: Math.abs(anchorY - y),
                         descriptor: desc || selector,
-                        text: raw.slice(0, 200)
-                    });
-                }
-            }
-
-            if (!priceCandidates.length) {
-                for (const node of document.querySelectorAll("div,span,p")) {
-                    if (!inRegion(node)) continue;
-                    const text = ownText(node);
-                    if (text.length > 180) continue;
-                    if (!/current price is|price when purchased online/i.test(text)) continue;
-                    const values = parsePrices(text);
-                    if (!values.length) continue;
-                    priceCandidates.push({
-                        value: values[0],
-                        priority: 50,
-                        y: pageY(node),
-                        descriptor: descriptors(node),
-                        text: text.slice(0, 200)
+                        text: raw.slice(0, 240)
                     });
                 }
             }
 
             priceCandidates.sort((a, b) =>
                 (a.priority - b.priority) ||
-                (Math.abs(a.y - cartAnchorY) - Math.abs(b.y - cartAnchorY))
+                (a.distance - b.distance) ||
+                (a.y - b.y)
             );
-            const primaryPrice = priceCandidates.length ? priceCandidates[0] : null;
+
+            const primaryPrice = priceCandidates[0] || null;
             const primaryPriceValues = primaryPrice
                 ? Array.from(new Set(
                     priceCandidates
                         .filter(candidate =>
-                            candidate.priority === primaryPrice.priority &&
-                            Math.abs(candidate.y - primaryPrice.y) <= 180
+                            candidate.priority <= primaryPrice.priority + 1 &&
+                            Math.abs(candidate.y - primaryPrice.y) <= 120
                         )
                         .map(candidate => candidate.value)
                 ))
                 : [];
 
+            const allControls = Array.from(document.querySelectorAll(
+                "button,[role='button'],input[type='button'],input[type='submit']," +
+                "[data-automation-id*='add-to-cart'],[data-testid*='add-to-cart']"
+            )).filter(inPurchaseWindow);
+
+            const addControls = allControls.filter(el => {
+                const label = normalizedLabel(el);
+                const y = pageY(el);
+                return (
+                    label.includes("add to cart") ||
+                    label.includes("add to basket") ||
+                    label.includes("add to bag")
+                ) &&
+                y >= anchorY - 80 &&
+                y <= anchorY + 520 &&
+                !belongsToDifferentItem(el);
+            }).sort((a, b) =>
+                (Number(disabled(a)) - Number(disabled(b))) ||
+                (Math.abs(pageY(a) - anchorY) - Math.abs(pageY(b) - anchorY))
+            );
+
+            const enabledAdd = addControls.find(el => !disabled(el)) || null;
+            const disabledAdd = addControls.find(el => disabled(el)) || null;
+
             const fulfillmentLabels = ["shipping", "pickup", "delivery"];
             const fulfillment = {};
             const fulfillmentRanges = [];
 
-            function fulfillmentState(text, label) {
-                const lower = text.toLowerCase();
-                if (/out of stock|not available|unavailable|sold out/.test(lower)) {
+            function fulfillmentState(value) {
+                const lower = value.toLowerCase();
+                if (
+                    /out of stock|not available|unavailable|sold out/
+                        .test(lower)
+                ) {
                     return "UNAVAILABLE";
                 }
                 if (
-                    /arrives|delivery date|order within|free shipping|today|tomorrow|get it nearby|ready in/.test(lower)
+                    /arrives|delivery date|order within|free shipping|today|tomorrow|get it nearby|ready in/
+                        .test(lower)
                 ) {
                     return "AVAILABLE";
-                }
-                if (label === "pickup" && /check nearby/.test(lower)) {
-                    return "UNKNOWN";
                 }
                 return "UNKNOWN";
             }
 
             for (const node of document.querySelectorAll("div,span,p,h3,h4")) {
-                if (!inRegion(node)) continue;
-                const label = ownText(node).toLowerCase();
+                if (!inPurchaseWindow(node)) continue;
+                const label = (directText(node) || ownText(node)).toLowerCase();
                 if (!fulfillmentLabels.includes(label)) continue;
 
                 let box = node.parentElement;
-                let chosen = null;
-                for (let i = 0; box && i < 5; i++, box = box.parentElement) {
-                    const text = ownText(box);
-                    if (text.length >= label.length && text.length <= 550) {
-                        chosen = box;
-                        if (/out of stock|not available|arrives|order within|check nearby|get it nearby|today|tomorrow/i.test(text)) {
+                let selected = null;
+                for (
+                    let depth = 0;
+                    box && depth < 5;
+                    depth++, box = box.parentElement
+                ) {
+                    if (!inPurchaseWindow(box)) continue;
+                    const value = ownText(box);
+                    if (value.length >= label.length && value.length <= 550) {
+                        selected = box;
+                        if (
+                            /out of stock|not available|unavailable|arrives|order within|today|tomorrow|check nearby|get it nearby/i
+                                .test(value)
+                        ) {
                             break;
                         }
                     }
                 }
-                if (!chosen) continue;
-                const text = ownText(chosen);
-                const top = pageY(chosen);
-                const height = chosen.getBoundingClientRect().height;
+
+                if (!selected) continue;
+                const value = ownText(selected);
+                const top = pageY(selected);
+                const bottom = top + selected.getBoundingClientRect().height;
                 fulfillment[label] = {
-                    state: fulfillmentState(text, label),
-                    text: text.slice(0, 400),
+                    state: fulfillmentState(value),
+                    text: value.slice(0, 400),
                     top,
-                    bottom: top + height
+                    bottom
                 };
-                fulfillmentRanges.push({
-                    label,
-                    top,
-                    bottom: top + height
-                });
+                fulfillmentRanges.push({label, top, bottom});
             }
 
             function fulfillmentFor(node) {
                 const y = pageY(node);
-                const match = fulfillmentRanges.find(range =>
-                    y >= range.top - 5 && y <= range.bottom + 5
+                const match = fulfillmentRanges.find(
+                    range => y >= range.top - 5 && y <= range.bottom + 5
                 );
                 return match ? match.label : "";
             }
@@ -802,105 +939,91 @@ class WalmartScraper(BaseScraper):
             const selectedOosTexts = [];
             const productOosTexts = [];
             const genericOosTexts = [];
-            const firstFulfillmentY = fulfillmentRanges.length
-                ? Math.min(...fulfillmentRanges.map(item => item.top))
-                : regionBottom;
-            const primaryPriceY = primaryPrice ? primaryPrice.y : headingY;
 
             for (const node of document.querySelectorAll("div,span,p,button")) {
-                if (!inRegion(node)) continue;
+                if (!inPurchaseWindow(node)) continue;
+
                 const fullText = ownText(node);
                 if (!fullText || fullText.length > 220) continue;
 
-                // Parent containers often combine the selected item with
-                // messages for another variant or fulfillment method. Only a
-                // direct/leaf status is allowed to become product-level OOS.
-                const atomicText = directText(node) ||
+                const atomicText =
+                    directText(node) ||
                     (node.children.length === 0 ? fullText : "");
-                const text = atomicText || fullText;
-                const mode = fulfillmentFor(node);
+                const value = atomicText || fullText;
+                const fulfillmentMode = fulfillmentFor(node);
 
-                if (/low stock|limited stock|only\s+\d+\s+(?:left|remaining|in stock)/i.test(text)) {
-                    const inventoryY = pageY(node);
-                    const inVariantInventoryArea = hasTokenAncestor(
+                if (
+                    /low stock|limited stock|only\s+\d+\s+(?:left|remaining|in stock)/i
+                        .test(value)
+                ) {
+                    const inVariantArea = hasTokenAncestor(
                         node,
                         ["variant", "swatch", "option", "choice"],
                         8
                     );
-                    const closeToPrimaryBuyBox =
-                        inventoryY >= primaryPriceY - 140 &&
-                        inventoryY <= Math.min(
-                            regionBottom,
-                            firstFulfillmentY + 520
-                        );
-                    const containsPrimaryCart = Boolean(
-                        enabledAdd &&
-                        (node === enabledAdd || node.contains(enabledAdd))
-                    );
-
-                    if (
-                        !inVariantInventoryArea &&
-                        (Boolean(mode) || closeToPrimaryBuyBox || containsPrimaryCart)
-                    ) {
-                        inventoryTexts.push(text);
-                    }
+                    if (!inVariantArea) inventoryTexts.push(value);
                 }
 
-                if (/selected option[^.]{0,80}(?:out of stock|unavailable|sold out)/i.test(text)) {
-                    selectedOosTexts.push(text);
+                if (
+                    /selected option[^.]{0,100}(?:out of stock|unavailable|not available|sold out)/i
+                        .test(value)
+                ) {
+                    selectedOosTexts.push(value);
                     continue;
                 }
 
-                if (!/(?:out of stock|sold out|currently unavailable|this item is unavailable|no longer available)/i.test(text)) {
+                if (
+                    !/(?:out of stock|sold out|currently unavailable|this item is unavailable|not available|no longer available)/i
+                        .test(value)
+                ) {
                     continue;
                 }
 
-                if (mode) {
-                    genericOosTexts.push(`${mode}: ${text}`);
+                if (fulfillmentMode) {
+                    genericOosTexts.push(`${fulfillmentMode}: ${value}`);
                     continue;
                 }
 
-                const y = pageY(node);
                 const inVariantArea = hasTokenAncestor(
                     node,
                     ["variant", "swatch", "option", "choice"],
                     7
                 );
-                const containsEnabledCart = Boolean(
-                    enabledAdd && (node === enabledAdd || node.contains(enabledAdd))
-                );
-                const isStandaloneProductStatus =
-                    /^(?:this item is )?(?:out of stock|sold out|currently unavailable|unavailable|no longer available)[.!]?$/i
+                const standaloneProductStatus =
+                    /^(?:this item is )?(?:out of stock|sold out|currently unavailable|unavailable|not available|no longer available)[.!]?$/i
                         .test(atomicText);
-                const nearPrimaryPrice =
-                    y >= primaryPriceY - 180 &&
-                    y <= Math.min(firstFulfillmentY + 40, primaryPriceY + 850);
+                const y = pageY(node);
+                const closeToAnchor =
+                    y >= anchorY - 80 &&
+                    y <= anchorY + 520;
 
                 if (
-                    isStandaloneProductStatus &&
+                    standaloneProductStatus &&
                     !inVariantArea &&
-                    !containsEnabledCart &&
-                    nearPrimaryPrice
+                    closeToAnchor
                 ) {
                     productOosTexts.push(atomicText);
                 } else {
-                    genericOosTexts.push(text);
+                    genericOosTexts.push(value);
                 }
             }
 
-            const regionTextNodes = Array.from(document.querySelectorAll("div,span,p"))
-                .filter(inRegion)
-                .map(ownText)
-                .filter(text => text && text.length <= 220);
-            const sellerText = regionTextNodes.find(text =>
-                /sold (?:and shipped )?by|sold by|fulfilled by/i.test(text)
+            const regionTextNodes = Array.from(
+                document.querySelectorAll("div,span,p")
+            ).filter(inPurchaseWindow)
+             .map(ownText)
+             .filter(value => value && value.length <= 220);
+
+            const sellerText = regionTextNodes.find(value =>
+                /sold (?:and shipped )?by|sold by|fulfilled by/i.test(value)
             ) || "";
 
             return {
                 regionFound: true,
-                title,
-                regionTop,
-                regionBottom,
+                exactItemAnchor: true,
+                currentItemMatch,
+                targetItemId: targetId,
+                currentItemId,
                 enabledCta: Boolean(enabledAdd),
                 disabledCta: Boolean(disabledAdd),
                 ctaText: enabledAdd
@@ -908,13 +1031,9 @@ class WalmartScraper(BaseScraper):
                     : disabledAdd
                     ? normalizedLabel(disabledAdd)
                     : "",
-                ctaY: enabledAdd
-                    ? pageY(enabledAdd)
-                    : disabledAdd
-                    ? pageY(disabledAdd)
-                    : null,
                 priceValues: primaryPriceValues,
                 priceCandidate: primaryPrice,
+                priceCandidates: priceCandidates.slice(0, 8),
                 inventoryText: Array.from(new Set(inventoryTexts)).join(" | "),
                 selectedOptionOos: selectedOosTexts.length > 0,
                 selectedOosTexts: Array.from(new Set(selectedOosTexts)).slice(0, 5),
@@ -923,44 +1042,46 @@ class WalmartScraper(BaseScraper):
                 genericOosTexts: Array.from(new Set(genericOosTexts)).slice(0, 8),
                 fulfillment,
                 sellerText,
-                reason: "Primary rendered product signals collected independently."
+                reason: "Primary Walmart purchase evidence was anchored to the requested item."
             };
         """
 
-        data = driver.execute_script(script, title) or {}
+        data = driver.execute_script(script, title, item_id) or {}
 
-        # Defense in depth: only a standalone product-level status may reach
-        # the OOS policy. This prevents a parent container such as
-        # "Delivery — Out of stock" or a different color's status from being
-        # promoted to the selected product's state.
         strong_product_oos = [
-            str(text).strip()
-            for text in (data.get("productOosTexts") or [])
-            if self._is_strong_product_oos_text(text)
+            str(value).strip()
+            for value in (data.get("productOosTexts") or [])
+            if self._is_strong_product_oos_text(value)
         ]
         data["productOosTexts"] = strong_product_oos
         data["productOos"] = bool(strong_product_oos)
 
-        stock, quantity, reason, internal_conflict, oos_scope = (
-            self.policy.classify_rendered_signals(data)
-        )
+        (
+            stock,
+            quantity,
+            reason,
+            internal_conflict,
+            oos_scope,
+        ) = self.policy.classify_rendered_signals(data)
+
         price = self._candidate_price(data.get("priceValues") or [])
-        seller = self._seller_from_text(str(data.get("sellerText", "")))
+        seller = self._seller_from_text(str(data.get("sellerText") or ""))
         price_candidate = data.get("priceCandidate") or {}
-        selector = str(price_candidate.get("descriptor", ""))
 
         details = {
             "internal_conflict": internal_conflict,
             "oos_scope": oos_scope,
             "region_found": bool(data.get("regionFound")),
-            "region_top": data.get("regionTop"),
-            "region_bottom": data.get("regionBottom"),
+            "exact_item_anchor": bool(data.get("exactItemAnchor")),
+            "current_item_match": bool(data.get("currentItemMatch")),
+            "target_item_id": str(data.get("targetItemId") or ""),
+            "current_item_id": str(data.get("currentItemId") or ""),
             "enabled_cta": bool(data.get("enabledCta")),
             "disabled_cta": bool(data.get("disabledCta")),
-            "cta_text": data.get("ctaText") or "",
-            "cta_y": data.get("ctaY"),
+            "cta_text": str(data.get("ctaText") or ""),
             "price_candidate": price_candidate,
-            "inventory_text": data.get("inventoryText") or "",
+            "price_candidates": data.get("priceCandidates") or [],
+            "inventory_text": str(data.get("inventoryText") or ""),
             "selected_option_oos": bool(data.get("selectedOptionOos")),
             "selected_oos_texts": data.get("selectedOosTexts") or [],
             "product_oos": bool(data.get("productOos")),
@@ -973,23 +1094,43 @@ class WalmartScraper(BaseScraper):
         if internal_conflict:
             confidence = 0.20
         elif stock == StockState.IN_STOCK:
-            confidence = 0.96 if data.get("enabledCta") else 0.72
+            confidence = (
+                0.98
+                if (
+                    data.get("enabledCta")
+                    and data.get("exactItemAnchor")
+                    and price is not None
+                )
+                else 0.65
+            )
         elif stock in {
             StockState.LOW_STOCK,
             StockState.LIMITED_STOCK,
             StockState.QUANTITY_REMAINING,
         }:
-            confidence = 0.97 if data.get("enabledCta") else 0.80
+            confidence = (
+                0.98
+                if data.get("enabledCta") and data.get("exactItemAnchor")
+                else 0.75
+            )
         elif stock == StockState.OOS:
-            confidence = 0.95
+            confidence = (
+                0.98
+                if data.get("exactItemAnchor")
+                and (
+                    data.get("productOos")
+                    or oos_scope in {"selected_option", "all_fulfillment"}
+                )
+                else 0.80
+            )
 
         text_parts = [
-            str(data.get("inventoryText", "")),
+            str(data.get("inventoryText") or ""),
             " | ".join(data.get("selectedOosTexts") or []),
             " | ".join(data.get("productOosTexts") or []),
             " | ".join(data.get("genericOosTexts") or []),
         ]
-        text = " | ".join(part for part in text_parts if part)
+        observed_text = " | ".join(part for part in text_parts if part)
 
         return WalmartObservation(
             source="visual",
@@ -997,11 +1138,15 @@ class WalmartScraper(BaseScraper):
             price=price,
             quantity=quantity,
             confidence=confidence,
-            title_match=bool(data.get("regionFound")),
+            title_match=bool(
+                data.get("regionFound")
+                and data.get("exactItemAnchor")
+                and data.get("currentItemMatch")
+            ),
             seller=seller,
-            text=text,
+            text=observed_text,
             reason=reason,
-            selector=selector,
+            selector=str(price_candidate.get("descriptor") or ""),
             details=details,
         )
 
@@ -1018,7 +1163,7 @@ class WalmartScraper(BaseScraper):
             re.fullmatch(
                 r"(?:this item is )?"
                 r"(?:out of stock|sold out|currently unavailable|"
-                r"unavailable|no longer available)[.!]?",
+                r"unavailable|not available|no longer available)[.!]?",
                 normalized,
             )
         )
@@ -1199,6 +1344,7 @@ class WalmartScraper(BaseScraper):
             or availability in {
                 "OUT_OF_STOCK",
                 "UNAVAILABLE",
+                "NOT_AVAILABLE",
                 "SOLD_OUT",
                 "PREORDER",
             }
