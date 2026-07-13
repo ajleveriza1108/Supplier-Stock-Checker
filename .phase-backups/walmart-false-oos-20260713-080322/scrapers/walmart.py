@@ -31,7 +31,7 @@ from scrapers.walmart_policy import (
 )
 
 
-WALMART_VISUAL_FIX_VERSION = "2026.07.13.2"
+WALMART_VISUAL_FIX_VERSION = "2026.07.12.2"
 
 
 class WalmartScraper(BaseScraper):
@@ -255,13 +255,6 @@ class WalmartScraper(BaseScraper):
             return self._last_results.get(url)
 
     def _wait_for_product_page(self, driver) -> None:
-        """Wait for Walmart's asynchronously rendered purchase state.
-
-        Walmart often renders the heading before the buy box. Reading the
-        page too early can miss an enabled Add to cart button while still
-        seeing a fulfillment-specific or stale out-of-stock message.
-        """
-
         try:
             WebDriverWait(driver, self.render_timeout).until(
                 lambda current: current.execute_script(
@@ -282,71 +275,6 @@ class WalmartScraper(BaseScraper):
                 )
             )
         except (TimeoutException, WebDriverException):
-            pass
-
-        purchase_ready_script = r"""
-            function visible(el) {
-                if (!el) return false;
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                return style.display !== "none" &&
-                       style.visibility !== "hidden" &&
-                       Number(style.opacity || "1") > 0 &&
-                       rect.width > 1 && rect.height > 1;
-            }
-
-            function label(el) {
-                return [
-                    el.innerText || el.textContent || "",
-                    el.getAttribute("aria-label") || "",
-                    el.getAttribute("title") || "",
-                    el.getAttribute("value") || "",
-                    el.getAttribute("data-automation-id") || "",
-                    el.getAttribute("data-testid") || ""
-                ].join(" " ).replace(/\s+/g, " " ).trim().toLowerCase();
-            }
-
-            const controls = Array.from(document.querySelectorAll(
-                "button,[role='button'],input[type='button']," +
-                "input[type='submit'],[data-automation-id*='add-to-cart']," +
-                "[data-testid*='add-to-cart']"
-            )).filter(visible);
-
-            const hasCart = controls.some(el => {
-                const text = label(el);
-                return text.includes("add to cart") ||
-                       text.includes("add to basket") ||
-                       text.includes("add to bag");
-            });
-
-            const statusNodes = Array.from(document.querySelectorAll(
-                "main div,main span,main p,main button"
-            )).filter(visible);
-            const hasStandaloneOos = statusNodes.some(el => {
-                const text = (el.innerText || el.textContent || "")
-                    .replace(/\s+/g, " " ).trim().toLowerCase();
-                return /^(?:this item is )?(?:out of stock|sold out|currently unavailable|unavailable)[.!]?$/.test(text);
-            });
-
-            const hasPrice = Array.from(document.querySelectorAll(
-                '[data-automation-id="product-price"],' +
-                '[data-testid="product-price"],' +
-                '[data-testid*="product-price"],' +
-                '[data-testid="price-wrap"]'
-            )).some(visible);
-
-            return Boolean(hasCart || hasStandaloneOos || hasPrice);
-        """
-
-        try:
-            WebDriverWait(driver, self.render_timeout).until(
-                lambda current: bool(
-                    current.execute_script(purchase_ready_script)
-                )
-            )
-        except (TimeoutException, WebDriverException):
-            # The policy will keep an inconclusive page out of automatic
-            # sheet updates.
             pass
 
         if self.post_ready_delay:
@@ -413,20 +341,14 @@ class WalmartScraper(BaseScraper):
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        inventory_text = self._item_inventory_text(best_item)
         if stock in {
             StockState.IN_STOCK,
             StockState.LOW_STOCK,
             StockState.LIMITED_STOCK,
             StockState.QUANTITY_REMAINING,
         }:
-            # Do not scan the complete product object for low-stock text.
-            # Walmart often nests other variants, seller offers, and
-            # recommendations inside the exact item object.  Only direct
-            # selected-item and fulfillment fields are allowed to influence
-            # the user's low-inventory -> OOS business rule.
             stock, quantity = parse_inventory_detail(
-                inventory_text,
+                raw_text,
                 quantity=quantity,
                 available=True,
             )
@@ -445,7 +367,7 @@ class WalmartScraper(BaseScraper):
             confidence=confidence,
             exact_item_match=True,
             seller=seller,
-            text=inventory_text or raw_text,
+            text=raw_text,
             reason=(
                 f"Exact item {item_id} found in {best_source}; "
                 f"{stock_reason}"
@@ -453,8 +375,6 @@ class WalmartScraper(BaseScraper):
             details={
                 "item_score": best_score,
                 "internal_conflict": conflict,
-                "inventory_text": inventory_text,
-                "raw_item_excerpt": raw_text[:1200],
             },
         )
 
@@ -529,27 +449,6 @@ class WalmartScraper(BaseScraper):
                     .trim();
             }
 
-            function directText(el) {
-                if (!el) return "";
-                return Array.from(el.childNodes || [])
-                    .filter(node => node.nodeType === Node.TEXT_NODE)
-                    .map(node => node.textContent || "")
-                    .join(" " )
-                    .replace(/\s+/g, " " )
-                    .trim();
-            }
-
-            function hasTokenAncestor(el, tokens, maxDepth = 8) {
-                let current = el;
-                for (let i = 0; current && i < maxDepth; i++, current = current.parentElement) {
-                    const desc = descriptors(current);
-                    if (tokens.some(token => desc.includes(token))) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-
             function parsePrices(raw) {
                 const values = [];
                 const text = String(raw || "");
@@ -618,8 +517,7 @@ class WalmartScraper(BaseScraper):
             }
 
             const allControls = Array.from(document.querySelectorAll(
-                "button,[role='button'],input[type='button'],input[type='submit']," +
-                "[data-automation-id*='add-to-cart'],[data-testid*='add-to-cart']"
+                "button,[role='button'],input[type='button'],input[type='submit']"
             )).filter(inRegion);
 
             const addControls = allControls.filter(el => {
@@ -631,11 +529,6 @@ class WalmartScraper(BaseScraper):
 
             const enabledAdd = addControls.find(el => !disabled(el)) || null;
             const disabledAdd = addControls.find(el => disabled(el)) || null;
-            const cartAnchorY = enabledAdd
-                ? pageY(enabledAdd)
-                : disabledAdd
-                ? pageY(disabledAdd)
-                : headingY + 900;
 
             const priceSelectors = [
                 '[data-automation-id="product-price"]',
@@ -668,24 +561,6 @@ class WalmartScraper(BaseScraper):
                     ) {
                         continue;
                     }
-
-                    const anchorNode = (
-                        node.tagName === "META" && node.parentElement
-                    ) ? node.parentElement : node;
-                    const candidateY = pageY(anchorNode);
-                    const inVariantPriceArea = hasTokenAncestor(
-                        anchorNode,
-                        ["variant", "swatch", "option", "choice"],
-                        8
-                    );
-                    if (
-                        inVariantPriceArea ||
-                        candidateY < headingY - 60 ||
-                        candidateY > cartAnchorY + 240
-                    ) {
-                        continue;
-                    }
-
                     const raw = [
                         node.getAttribute("content") || "",
                         node.getAttribute("aria-label") || "",
@@ -696,7 +571,11 @@ class WalmartScraper(BaseScraper):
                     priceCandidates.push({
                         value: values[0],
                         priority,
-                        y: candidateY,
+                        y: pageY(
+                            node.tagName === "META" && node.parentElement
+                                ? node.parentElement
+                                : node
+                        ),
                         descriptor: desc || selector,
                         text: raw.slice(0, 200)
                     });
@@ -722,20 +601,9 @@ class WalmartScraper(BaseScraper):
             }
 
             priceCandidates.sort((a, b) =>
-                (a.priority - b.priority) ||
-                (Math.abs(a.y - cartAnchorY) - Math.abs(b.y - cartAnchorY))
+                (a.priority - b.priority) || (a.y - b.y)
             );
             const primaryPrice = priceCandidates.length ? priceCandidates[0] : null;
-            const primaryPriceValues = primaryPrice
-                ? Array.from(new Set(
-                    priceCandidates
-                        .filter(candidate =>
-                            candidate.priority === primaryPrice.priority &&
-                            Math.abs(candidate.y - primaryPrice.y) <= 180
-                        )
-                        .map(candidate => candidate.value)
-                ))
-                : [];
 
             const fulfillmentLabels = ["shipping", "pickup", "delivery"];
             const fulfillment = {};
@@ -809,41 +677,13 @@ class WalmartScraper(BaseScraper):
 
             for (const node of document.querySelectorAll("div,span,p,button")) {
                 if (!inRegion(node)) continue;
-                const fullText = ownText(node);
-                if (!fullText || fullText.length > 220) continue;
-
-                // Parent containers often combine the selected item with
-                // messages for another variant or fulfillment method. Only a
-                // direct/leaf status is allowed to become product-level OOS.
-                const atomicText = directText(node) ||
-                    (node.children.length === 0 ? fullText : "");
-                const text = atomicText || fullText;
+                const text = ownText(node);
+                if (!text || text.length > 220) continue;
+                const lower = text.toLowerCase();
                 const mode = fulfillmentFor(node);
 
                 if (/low stock|limited stock|only\s+\d+\s+(?:left|remaining|in stock)/i.test(text)) {
-                    const inventoryY = pageY(node);
-                    const inVariantInventoryArea = hasTokenAncestor(
-                        node,
-                        ["variant", "swatch", "option", "choice"],
-                        8
-                    );
-                    const closeToPrimaryBuyBox =
-                        inventoryY >= primaryPriceY - 140 &&
-                        inventoryY <= Math.min(
-                            regionBottom,
-                            firstFulfillmentY + 520
-                        );
-                    const containsPrimaryCart = Boolean(
-                        enabledAdd &&
-                        (node === enabledAdd || node.contains(enabledAdd))
-                    );
-
-                    if (
-                        !inVariantInventoryArea &&
-                        (Boolean(mode) || closeToPrimaryBuyBox || containsPrimaryCart)
-                    ) {
-                        inventoryTexts.push(text);
-                    }
+                    inventoryTexts.push(text);
                 }
 
                 if (/selected option[^.]{0,80}(?:out of stock|unavailable|sold out)/i.test(text)) {
@@ -861,28 +701,14 @@ class WalmartScraper(BaseScraper):
                 }
 
                 const y = pageY(node);
-                const inVariantArea = hasTokenAncestor(
-                    node,
-                    ["variant", "swatch", "option", "choice"],
-                    7
-                );
-                const containsEnabledCart = Boolean(
-                    enabledAdd && (node === enabledAdd || node.contains(enabledAdd))
-                );
-                const isStandaloneProductStatus =
-                    /^(?:this item is )?(?:out of stock|sold out|currently unavailable|unavailable|no longer available)[.!]?$/i
-                        .test(atomicText);
+                const desc = descriptors(node);
+                const inVariantArea = /variant|swatch|option|choice/.test(desc);
                 const nearPrimaryPrice =
                     y >= primaryPriceY - 180 &&
                     y <= Math.min(firstFulfillmentY + 40, primaryPriceY + 850);
 
-                if (
-                    isStandaloneProductStatus &&
-                    !inVariantArea &&
-                    !containsEnabledCart &&
-                    nearPrimaryPrice
-                ) {
-                    productOosTexts.push(atomicText);
+                if (!inVariantArea && nearPrimaryPrice) {
+                    productOosTexts.push(text);
                 } else {
                     genericOosTexts.push(text);
                 }
@@ -913,7 +739,7 @@ class WalmartScraper(BaseScraper):
                     : disabledAdd
                     ? pageY(disabledAdd)
                     : null,
-                priceValues: primaryPriceValues,
+                priceValues: primaryPrice ? [primaryPrice.value] : [],
                 priceCandidate: primaryPrice,
                 inventoryText: Array.from(new Set(inventoryTexts)).join(" | "),
                 selectedOptionOos: selectedOosTexts.length > 0,
@@ -928,19 +754,6 @@ class WalmartScraper(BaseScraper):
         """
 
         data = driver.execute_script(script, title) or {}
-
-        # Defense in depth: only a standalone product-level status may reach
-        # the OOS policy. This prevents a parent container such as
-        # "Delivery — Out of stock" or a different color's status from being
-        # promoted to the selected product's state.
-        strong_product_oos = [
-            str(text).strip()
-            for text in (data.get("productOosTexts") or [])
-            if self._is_strong_product_oos_text(text)
-        ]
-        data["productOosTexts"] = strong_product_oos
-        data["productOos"] = bool(strong_product_oos)
-
         stock, quantity, reason, internal_conflict, oos_scope = (
             self.policy.classify_rendered_signals(data)
         )
@@ -1003,24 +816,6 @@ class WalmartScraper(BaseScraper):
             reason=reason,
             selector=selector,
             details=details,
-        )
-
-    @staticmethod
-    def _is_strong_product_oos_text(value: Any) -> bool:
-        """Return True only for a standalone product-level OOS phrase.
-
-        Fulfillment, variant, seller, and recommendation text must remain
-        generic evidence and may never by itself update the sheet to OOS.
-        """
-
-        normalized = re.sub(r"\s+", " ", str(value or "")).strip().lower()
-        return bool(
-            re.fullmatch(
-                r"(?:this item is )?"
-                r"(?:out of stock|sold out|currently unavailable|"
-                r"unavailable|no longer available)[.!]?",
-                normalized,
-            )
         )
 
     @staticmethod
@@ -1182,17 +977,6 @@ class WalmartScraper(BaseScraper):
                 for value in fulfillment_statuses
             )
         )
-        all_fulfillment_unavailable = (
-            len(fulfillment_statuses) >= 2
-            and all(
-                value in {
-                    "OUT_OF_STOCK",
-                    "UNAVAILABLE",
-                    "NOT_AVAILABLE",
-                }
-                for value in fulfillment_statuses
-            )
-        )
         explicit_oos = (
             item.get("isOutOfStock") is True
             or buy_box.get("isOutOfStock") is True
@@ -1202,7 +986,18 @@ class WalmartScraper(BaseScraper):
                 "SOLD_OUT",
                 "PREORDER",
             }
-            or all_fulfillment_unavailable
+            or (
+                fulfillment_statuses
+                and all(
+                    value in {
+                        "OUT_OF_STOCK",
+                        "UNAVAILABLE",
+                        "NOT_AVAILABLE",
+                    }
+                    for value in fulfillment_statuses
+                    if value
+                )
+            )
         )
 
         if explicit_in and explicit_oos:
@@ -1253,79 +1048,6 @@ class WalmartScraper(BaseScraper):
             if parsed is not None:
                 return parsed
         return None
-
-    @staticmethod
-    def _item_inventory_text(item: dict[str, Any]) -> str:
-        """Return stock wording scoped to the selected exact item.
-
-        The exact Walmart product object can contain nested variants, seller
-        offers, and recommendations.  Scanning its complete JSON text can
-        incorrectly promote another option's "Limited stock" message to the
-        selected product.  This helper intentionally reads only direct item,
-        buy-box, and fulfillment fields.
-        """
-
-        values: list[str] = []
-
-        def add(value: Any) -> None:
-            if value in (None, "", [], {}):
-                return
-            if isinstance(value, (str, int, float, bool)):
-                normalized = re.sub(r"\s+", " ", str(value)).strip()
-                if normalized and normalized not in values:
-                    values.append(normalized)
-
-        direct_keys = (
-            "availabilityStatus",
-            "availability",
-            "inventoryStatus",
-            "stockStatus",
-            "availabilityDisplay",
-            "availabilityText",
-            "inventoryText",
-            "inventoryMessage",
-            "stockMessage",
-            "statusText",
-            "message",
-            "availableQuantity",
-            "availableCount",
-            "inventoryCount",
-            "quantity",
-        )
-
-        for key in direct_keys:
-            add(item.get(key))
-
-        buy_box = item.get("buyBox")
-        if isinstance(buy_box, dict):
-            for key in direct_keys:
-                add(buy_box.get(key))
-            cta = buy_box.get("cta")
-            if isinstance(cta, dict):
-                for key in ("text", "buttonText", "label"):
-                    add(cta.get(key))
-            else:
-                add(cta)
-
-        for option in item.get("fulfillmentOptions") or []:
-            if not isinstance(option, dict):
-                continue
-            for key in direct_keys:
-                add(option.get(key))
-            for nested_key in (
-                "availability",
-                "inventory",
-                "shippingOption",
-                "pickupOption",
-                "deliveryOption",
-            ):
-                nested = option.get(nested_key)
-                if not isinstance(nested, dict):
-                    continue
-                for key in direct_keys:
-                    add(nested.get(key))
-
-        return " | ".join(values)
 
     @staticmethod
     def _item_quantity(item: dict[str, Any]) -> Optional[int]:

@@ -55,7 +55,6 @@ from scrapers.lakeside import LakesideScraper
 from scrapers.collectionsetc import CollectionsEtcScraper
 
 from ui.review_window import ReviewUpdatesWindow
-from ui.log_color_policy import LogSeverity, classify_log_text, merge_severity, severity_tag
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
@@ -417,87 +416,18 @@ class StockPriceCheckerApp(ctk.CTk):
         self._write_log("🗑 Log window cleared", "info")
 
     def _write_log(self, message, tag="info", url=None):
-        # Block colors: white=no update, orange=change, red=error.
-        text = "" if message is None else str(message)
-
-        if not getattr(self, "_ssc_log_colors_ready", False):
-            self.log_text.tag_config("ssc_normal", foreground="#F5F5F5")
-            self.log_text.tag_config("ssc_change", foreground="#F39C12")
-            self.log_text.tag_config("ssc_error", foreground="#FF4D4F")
-            self._ssc_log_colors_ready = True
-            self._ssc_log_block_start = None
-            self._ssc_log_block_severity = LogSeverity.NORMAL
-            self._ssc_log_link_counter = 0
-
-        lines = text.splitlines() or [text]
-        starts_row = any(
-            line.lstrip().casefold().startswith("row:")
-            for line in lines
-        )
-        ends_block = any(
-            len(line.strip()) >= 20 and set(line.strip()) == {"-"}
-            for line in lines
-        )
-
-        incoming_severity = classify_log_text(text)
-        if str(tag).casefold() == "error":
-            incoming_severity = LogSeverity.ERROR
-
-        self.log_text.configure(state="normal")
-        insert_start = self.log_text.index("end-1c")
-
-        if starts_row:
-            self._ssc_log_block_start = insert_start
-            self._ssc_log_block_severity = LogSeverity.NORMAL
-
-        self.log_text.insert(tk.END, f"{text}\n")
-        insert_end = self.log_text.index("end-1c")
-
-        if self._ssc_log_block_start is not None:
-            self._ssc_log_block_severity = merge_severity(
-                self._ssc_log_block_severity,
-                incoming_severity,
-            )
-            paint_start = self._ssc_log_block_start
-            paint_tag = severity_tag(self._ssc_log_block_severity)
+        self.log_text.configure(state='normal')
+        if url and tag == "hyperlink":
+            self.log_text.insert(tk.END, f"{message}\n", tag)
+            start_idx = self.log_text.index(tk.END + "-2l")
+            end_idx = self.log_text.index(tk.END + "-1c")
+            self.log_text.tag_add("hyperlink", start_idx, end_idx)
+            self.log_text.tag_bind("hyperlink", "<Button-1>", lambda e, u=url: self.open_url(e, u))
         else:
-            paint_start = insert_start
-            paint_tag = severity_tag(incoming_severity)
-
-        for color_tag in ("ssc_normal", "ssc_change", "ssc_error"):
-            self.log_text.tag_remove(color_tag, paint_start, insert_end)
-        self.log_text.tag_add(paint_tag, paint_start, insert_end)
-
-        if url:
-            self._ssc_log_link_counter += 1
-            link_tag = f"ssc_link_{self._ssc_log_link_counter}"
-            self.log_text.tag_config(link_tag, underline=1)
-
-            url_text = str(url)
-            offset = text.find(url_text)
-            if offset >= 0:
-                link_start = f"{insert_start}+{offset}c"
-                link_end = f"{link_start}+{len(url_text)}c"
-            else:
-                link_start = insert_start
-                link_end = insert_end
-
-            self.log_text.tag_add(link_tag, link_start, link_end)
-            self.log_text.tag_bind(
-                link_tag,
-                "<Button-1>",
-                lambda event, target=url_text: self.open_url(event, target),
-            )
-
-        self.log_text.tag_raise("ssc_normal")
-        self.log_text.tag_raise("ssc_change")
-        self.log_text.tag_raise("ssc_error")
+            self.log_text.insert(tk.END, f"{message}\n", tag)
+            
         self.log_text.see(tk.END)
-        self.log_text.configure(state="disabled")
-
-        if ends_block:
-            self._ssc_log_block_start = None
-            self._ssc_log_block_severity = LogSeverity.NORMAL
+        self.log_text.configure(state='disabled')
 
     def open_url(self, event, url=None):
         if url:
