@@ -26,16 +26,7 @@ class ScrapingEngine:
         self.config_manager = config_manager
         self.scrapers = scrapers.copy()
 
-        if "WAL" in self.scrapers:
-            try:
-                from scrapers.walmart_doublecheck import WalmartDoubleCheckScraper
-                original = self.scrapers["WAL"]
-                self.scrapers["WAL"] = WalmartDoubleCheckScraper(
-                    browser_manager=getattr(original, 'browser_manager', None),
-                    logger_func=getattr(original, 'log', None)
-                )
-            except Exception:
-                pass 
+        # Walmart scratch rewrite: use the registered WalmartScraper
 
         self.queue = SimpleRuntimeLogQueue()
         # SIMPLE-RUNTIME-LOG:ENGINE-PATCHED

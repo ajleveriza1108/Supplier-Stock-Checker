@@ -1,0 +1,10 @@
+{
+  "name": "supplier-stock-checker-walmart-runtime",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Exact-item Walmart extraction runtime for Supplier Stock Checker",
+  "dependencies": {
+    "playwright": "1.54.2"
+  }
+}

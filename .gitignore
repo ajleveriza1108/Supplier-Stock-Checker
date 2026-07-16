@@ -106,3 +106,7 @@ failed_structured_install_backup_*/
 structured_scraper_fix_*.zip
 walmart_visual_fix_*.zip
 simple_runtime_log_fix_*.zip
+
+# Walmart Playwright scratch runtime
+logs/walmart_evidence/
+scrapers/walmart_runtime/node_modules/
