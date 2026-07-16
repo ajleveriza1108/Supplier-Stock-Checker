@@ -31,7 +31,7 @@ from scrapers.walmart_policy import (
 )
 
 
-WALMART_VISUAL_FIX_VERSION = "2026.07.13.5"
+WALMART_VISUAL_FIX_VERSION = "2026.07.16.3"
 
 
 class WalmartScraper(BaseScraper):
@@ -871,6 +871,7 @@ class WalmartScraper(BaseScraper):
             const fulfillmentLabels = ["shipping", "pickup", "delivery"];
             const fulfillment = {};
             const fulfillmentRanges = [];
+            const fulfillmentInventoryTexts = [];
 
             function fulfillmentState(value) {
                 const lower = value.toLowerCase();
@@ -925,6 +926,18 @@ class WalmartScraper(BaseScraper):
                     bottom
                 };
                 fulfillmentRanges.push({label, top, bottom});
+
+                // Walmart often places "Low stock" or "Only N remaining"
+                // inside the selected fulfillment card instead of beside the
+                // primary Add to cart control. Preserve that wording as
+                // selected-item inventory evidence so the business rule can
+                // treat it as OOS.
+                if (
+                    /low stock|limited stock|only\s+\d+\s+(?:left|remaining|in stock)/i
+                        .test(value)
+                ) {
+                    fulfillmentInventoryTexts.push(value);
+                }
             }
 
             function fulfillmentFor(node) {
@@ -935,7 +948,7 @@ class WalmartScraper(BaseScraper):
                 return match ? match.label : "";
             }
 
-            const inventoryTexts = [];
+            const inventoryTexts = [...fulfillmentInventoryTexts];
             const selectedOosTexts = [];
             const productOosTexts = [];
             const genericOosTexts = [];
@@ -993,14 +1006,21 @@ class WalmartScraper(BaseScraper):
                     /^(?:this item is )?(?:out of stock|sold out|currently unavailable|unavailable|not available|no longer available)[.!]?$/i
                         .test(atomicText);
                 const y = pageY(node);
-                const closeToAnchor =
-                    y >= anchorY - 80 &&
+                // Product-level availability appears after the
+                // "Price when purchased online" anchor. Variant swatches and
+                // option summaries are rendered above it and may contain a
+                // standalone "Out of stock" label for a different color.
+                //
+                // Never promote an unavailable label above the purchase
+                // anchor to whole-product OOS.
+                const inProductStatusBand =
+                    y >= anchorY + 2 &&
                     y <= anchorY + 520;
 
                 if (
                     standaloneProductStatus &&
                     !inVariantArea &&
-                    closeToAnchor
+                    inProductStatusBand
                 ) {
                     productOosTexts.push(atomicText);
                 } else {
@@ -1024,6 +1044,9 @@ class WalmartScraper(BaseScraper):
                 currentItemMatch,
                 targetItemId: targetId,
                 currentItemId,
+                purchaseAnchorY: anchorY,
+                purchaseTop,
+                purchaseBottom,
                 enabledCta: Boolean(enabledAdd),
                 disabledCta: Boolean(disabledAdd),
                 ctaText: enabledAdd
@@ -1076,6 +1099,9 @@ class WalmartScraper(BaseScraper):
             "current_item_match": bool(data.get("currentItemMatch")),
             "target_item_id": str(data.get("targetItemId") or ""),
             "current_item_id": str(data.get("currentItemId") or ""),
+            "purchase_anchor_y": data.get("purchaseAnchorY"),
+            "purchase_top": data.get("purchaseTop"),
+            "purchase_bottom": data.get("purchaseBottom"),
             "enabled_cta": bool(data.get("enabledCta")),
             "disabled_cta": bool(data.get("disabledCta")),
             "cta_text": str(data.get("ctaText") or ""),
