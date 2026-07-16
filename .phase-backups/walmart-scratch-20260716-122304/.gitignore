@@ -1,0 +1,108 @@
+# ==================================================
+# Supplier Stock Checker
+# ==================================================
+
+# Python cache and compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Python virtual environments
+.venv/
+.venv*/
+venv/
+venv*/
+env/
+ENV/
+
+# Project-specific virtual environment
+.venv_DESKTOP-2DIER3G/
+
+# WebDriver downloads and browser profiles
+.wdm/
+browser_profiles/
+browser-profile/
+chrome-data/
+user-data-dir/
+
+# Generated downloads and logs
+downloaded_files/
+logs/
+*.log
+
+# Runtime databases and cache
+scraper_cache.db
+*.sqlite
+*.sqlite3
+
+# Local application settings and generated state
+app_config.json
+learned_rules.json
+config/ai_memory.json
+config/crash_recovery.json
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Google credentials and authentication files
+service_account.json
+service-account.json
+credentials.json
+client_secret*.json
+token.json
+
+# Private keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+
+# VPN configurations, credentials, and logs
+vpn/
+*.ovpn
+
+# Temporary and backup files
+tmp/
+temp/
+*.tmp
+*.bak
+*.swp
+~$*
+
+# Python build and packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# IDE and editor settings
+.vscode/
+.idea/
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+desktop.ini
+# Local repair backups
+_repair_backup_*/
+# Local source bundles and repair artifacts
+stock_checker_source_*.zip
+*.before_*.bak
+# Local credentials and runtime data
+auth.txt
+*.pyc
+*.db
+_repair_backup_structured_*/
+_repair_backup_walmart_visual_*/
+_repair_backup_simple_log_*/
+failed_structured_install_backup_*/
+structured_scraper_fix_*.zip
+walmart_visual_fix_*.zip
+simple_runtime_log_fix_*.zip

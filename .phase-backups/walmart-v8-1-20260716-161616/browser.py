@@ -612,8 +612,6 @@ class BraveDebugManager:
                 ],
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=10,
                 check=False,
             )
@@ -683,8 +681,7 @@ class BraveDebugManager:
             )
 
             service = Service(
-                executable_path=str(driver_path),
-                log_output=subprocess.DEVNULL,
+                executable_path=str(driver_path)
             )
 
             print(

@@ -62,8 +62,6 @@ from ui.log_color_policy import (
     severity_tag,
 )
 from ui.review_window import ReviewUpdatesWindow
-from core.local_ai_config import LocalAIConfig
-from ui.local_ai_settings import LocalAISettingsDialog
 
 
 ctk.set_appearance_mode("Dark")
@@ -127,7 +125,10 @@ class StockPriceCheckerApp(ctk.CTk):
             value=self.config_manager.get("enable_ai", True)
         )
         self.ai_engine_var = ctk.StringVar(
-            value="Regular (Regex)"
+            value=self.config_manager.get(
+                "ai_engine",
+                "Qwen2.5:14b (~9GB VRAM)",
+            )
         )
         self.headless_var = ctk.BooleanVar(
             value=self.config_manager.get("headless", False)
@@ -166,10 +167,6 @@ class StockPriceCheckerApp(ctk.CTk):
         self.countdown_seconds = 0
 
         self.setup_ui()
-        self.after(
-            250,
-            self._refresh_local_ai_status,
-        )
         self.after(100, self._poll_engine_queue)
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
         atexit.register(self.cleanup_on_exit)
@@ -433,7 +430,7 @@ class StockPriceCheckerApp(ctk.CTk):
 
         self.ai_toggle = ctk.CTkSwitch(
             self.settings_frame,
-            text="Local AI Cross-Check Changes",
+            text="Enable AI (Phase 2)",
             variable=self.enable_ai_var,
             progress_color="#1ABC9C",
             switch_width=32,
@@ -447,38 +444,34 @@ class StockPriceCheckerApp(ctk.CTk):
             pady=(8, 0),
         )
 
-        self.local_ai_setup_btn = ctk.CTkButton(
+        ctk.CTkLabel(
             self.settings_frame,
-            text="Configure Local AI",
-            command=self.open_local_ai_settings,
-            height=26,
-            fg_color="#34495E",
-            hover_color="#1ABC9C",
-        )
-        self.local_ai_setup_btn.grid(
+            text="AI Engine:",
+        ).grid(
             row=4,
             column=0,
             columnspan=2,
-            sticky="ew",
-            pady=(5, 3),
+            sticky="w",
+            pady=(4, 2),
         )
-
-        self.local_ai_status_var = ctk.StringVar(
-            value="Local AI: checking…"
-        )
-        self.local_ai_status_label = ctk.CTkLabel(
+        self.engine_dropdown = ctk.CTkOptionMenu(
             self.settings_frame,
-            textvariable=self.local_ai_status_var,
-            justify="left",
-            wraplength=210,
-            text_color="gray65",
-            font=ctk.CTkFont(size=11),
+            variable=self.ai_engine_var,
+            values=[
+                "Regular (Regex)",
+                "Qwen2.5:7b (~5GB VRAM)",
+                "Qwen2.5:14b (~9GB VRAM)",
+            ],
+            height=24,
+            fg_color="#34495E",
+            button_color="#2C3E50",
+            button_hover_color="#1ABC9C",
         )
-        self.local_ai_status_label.grid(
+        self.engine_dropdown.grid(
             row=5,
             column=0,
             columnspan=2,
-            sticky="w",
+            sticky="ew",
             pady=(0, 5),
         )
 
@@ -909,29 +902,6 @@ class StockPriceCheckerApp(ctk.CTk):
         )
         self.clear_btn.pack(side="left")
 
-    def open_local_ai_settings(self):
-        LocalAISettingsDialog(
-            self,
-            on_saved=self._refresh_local_ai_status,
-        )
-
-    def _refresh_local_ai_status(self):
-        config = LocalAIConfig.load()
-        ready, message = config.readiness()
-
-        if config.enabled and ready:
-            status = (
-                "Local AI: Ready — "
-                f"{config.resolved_model_path.name}"
-            )
-        elif config.enabled:
-            status = f"Local AI: Needs setup — {message}"
-        else:
-            status = "Local AI: Disabled"
-
-        if hasattr(self, "local_ai_status_var"):
-            self.local_ai_status_var.set(status)
-
     def copy_logs_to_clipboard(self):
         try:
             all_logs = self.log_text.get("1.0", "end").strip()
@@ -1205,37 +1175,17 @@ class StockPriceCheckerApp(ctk.CTk):
         self.engine.review_mode = self.review_mode_var.get()
 
         if self.enable_ai_var.get():
-            local_ai_config = LocalAIConfig.load()
-            local_ai_config.enabled = True
-            local_ai_config.save()
-
-            # Any value other than OFF queues changed rows
-            # for the existing Phase 2 workflow. The regex
-            # mode also prevents the old AI scraper bypass.
-            self.engine.ai_mode = "Regular (Regex)"
-
-            ready, detail = local_ai_config.readiness()
-            if ready:
-                self._write_log(
-                    "Local AI change cross-check enabled: "
-                    f"{local_ai_config.resolved_model_path.name}",
-                    "info",
-                )
-            else:
-                self._write_log(
-                    "Local AI is enabled but needs setup: "
-                    f"{detail} Changed rows will remain "
-                    "held for review.",
-                    "warning",
-                )
+            self.engine.ai_mode = self.ai_engine_var.get()
+            self._write_log(
+                f"Verification Engine selected: {self.engine.ai_mode}",
+                "info",
+            )
         else:
-            local_ai_config = LocalAIConfig.load()
-            local_ai_config.enabled = False
-            local_ai_config.save()
             self.engine.ai_mode = "OFF"
             self._write_log(
-                "Local AI change cross-check is disabled.",
-                "info",
+                "AI Verification (Phase 2) is DISABLED. "
+                "Updates will auto-confirm.",
+                "warning",
             )
 
         if self.sg_debug_var.get():
@@ -1439,7 +1389,7 @@ class StockPriceCheckerApp(ctk.CTk):
             self.review_check,
             self.vpn_check,
             self.sg_debug_check,
-            self.local_ai_setup_btn,
+            self.engine_dropdown,
             self.resume_btn,
             self.retry_btn,
             self.captcha_btn,
@@ -1470,7 +1420,7 @@ class StockPriceCheckerApp(ctk.CTk):
             self.review_check,
             self.vpn_check,
             self.sg_debug_check,
-            self.local_ai_setup_btn,
+            self.engine_dropdown,
             self.pause_btn,
             self.interval_entry,
             self.ai_toggle,
@@ -1504,7 +1454,7 @@ class StockPriceCheckerApp(ctk.CTk):
             self.review_check,
             self.vpn_check,
             self.sg_debug_check,
-            self.local_ai_setup_btn,
+            self.engine_dropdown,
             self.retry_btn,
             self.captcha_btn,
             self.interval_entry,

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-const VERSION = "2026.07.16.false-oos-unicode-v8";
+const VERSION = "2026.07.16.background-brave-tab-v6";
 
 const STOCK = Object.freeze({
   IN_STOCK: "In Stock",
@@ -67,27 +67,13 @@ function normalizePrice(value) {
 }
 
 function stockFromText(value) {
-  const original = normalizeText(value);
-
-  const text = original
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/[_/.:?-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .toLowerCase()
-    .trim();
+  const text = normalizeText(value).toLowerCase();
 
   if (!text) {
     return STOCK.UNKNOWN;
   }
 
-  // This function is for the overall selected item/offer only. Generic
-  // phrases such as "not available" are deliberately excluded because they
-  // commonly describe only pickup or delivery while shipping remains valid.
-  if (
-    /back[\s-]?order|sold out|out of stock|currently unavailable|item unavailable|no longer available|this item is unavailable|schema org out of stock/.test(
-      text
-    )
-  ) {
+  if (/back[\s-]?order|sold out|out of stock|currently unavailable|item unavailable/.test(text)) {
     return STOCK.OOS;
   }
 
@@ -95,73 +81,19 @@ function stockFromText(value) {
     return STOCK.LIMITED_STOCK;
   }
 
-  if (/low stock|few left/.test(text)) {
+  if (/low stock/.test(text)) {
     return STOCK.LOW_STOCK;
   }
 
-  if (
-    /only\s+\d+\s+(?:left|remaining|in stock)|\d+\s+left in stock/.test(
-      text
-    )
-  ) {
+  if (/only\s+\d+\s+(?:left|remaining|in stock)/.test(text)) {
     return STOCK.QUANTITY;
   }
 
-  if (
-    /\bin stock\b|schema org in stock/.test(text)
-  ) {
+  if (/\bin stock\b|available for shipping|shipping available/.test(text)) {
     return STOCK.IN_STOCK;
   }
 
   return STOCK.UNKNOWN;
-}
-
-function structuredStockFromText(value) {
-  const text = normalizeText(value)
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/[_/.:?-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .toLowerCase()
-    .trim();
-
-  if (/^(?:out of stock|sold out|not available|unavailable|backorder|back order)$/.test(text)) {
-    return STOCK.OOS;
-  }
-
-  if (/^(?:in stock|available)$/.test(text)) {
-    return STOCK.IN_STOCK;
-  }
-
-  return stockFromText(text);
-}
-
-function fulfillmentStockFromText(value) {
-  const text = normalizeText(value)
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/[_/.:?-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .toLowerCase()
-    .trim();
-
-  if (!text) {
-    return STOCK.UNKNOWN;
-  }
-
-  if (
-    /not available|unavailable|not offered|not eligible|cannot be shipped|can(?:not|'t) deliver|no pickup/.test(text)
-  ) {
-    return STOCK.OOS;
-  }
-
-  if (
-    /available for shipping|shipping available|available for delivery|delivery available|available for pickup|pickup available|arrives (?:today|tomorrow|by)|delivery (?:today|tomorrow|by)|pickup (?:today|tomorrow|ready)|ship(?:s|ping) (?:today|tomorrow|by)/.test(
-      text
-    )
-  ) {
-    return STOCK.IN_STOCK;
-  }
-
-  return stockFromText(text);
 }
 
 function readStdin() {
@@ -410,10 +342,6 @@ function objectItemIds(object) {
     "productId",
     "product_id",
     "offerId",
-    "sku",
-    "productID",
-    "productId",
-    "product_id",
   ]) {
     const value = object?.[key];
 
@@ -697,7 +625,7 @@ function pageEvidenceExpression(itemId) {
       return rect.top + scrollY;
     };
 
-    const tokenAncestor = (element, tokens, depth = 10) => {
+    const tokenAncestor = (element, tokens, depth = 9) => {
       let current = element;
 
       for (let index = 0; current && index < depth; index += 1) {
@@ -727,7 +655,6 @@ function pageEvidenceExpression(itemId) {
       "related",
       "also-viewed",
       "popular-picks",
-      "you-may-also-like",
     ];
 
     const main =
@@ -747,97 +674,46 @@ function pageEvidenceExpression(itemId) {
       ? pageY(h1) + h1.getBoundingClientRect().height
       : Math.max(scrollY, 0);
 
-    const allControls = [
-      ...main.querySelectorAll(
-        'button, [role="button"], input[type="button"], input[type="submit"], a'
-      ),
-    ]
+    const buttons = [...main.querySelectorAll("button")]
       .filter(visible)
-      .filter(control =>
-        !tokenAncestor(
-          control,
-          recommendationTokens,
-          10
+      .filter(button =>
+        /add to cart|add to basket/i.test(
+          normalize(button.textContent)
         )
       )
-      .map(control => {
-        const label = normalize(
-          control.getAttribute("aria-label") ||
-          control.getAttribute("title") ||
-          control.value ||
-          control.textContent
+      .filter(button => {
+        const y = pageY(button);
+
+        return (
+          y >= anchorY - 250 &&
+          y <= anchorY + 1900 &&
+          !tokenAncestor(
+            button,
+            recommendationTokens,
+            10
+          )
         );
-
-        const token = normalize([
-          control.getAttribute("data-testid") || "",
-          control.getAttribute("data-automation-id") || "",
-          control.id || "",
-          control.className || "",
-        ].join(" "));
-
-        return {
-          element: control,
-          label,
-          token,
-          y: pageY(control),
-          enabled:
-            !control.disabled &&
-            control.getAttribute("aria-disabled") !== "true",
-        };
       })
-      .filter(item =>
-        item.y >= anchorY - 300 &&
-        item.y <= anchorY + 2500
-      );
+      .sort((first, second) => {
+        const firstDistance = Math.abs(pageY(first) - anchorY);
+        const secondDistance = Math.abs(pageY(second) - anchorY);
+        return firstDistance - secondDistance;
+      });
 
-    const cartControls = allControls
-      .filter(item =>
-        /add to cart|add to basket|add item|add$|add to order/i.test(
-          item.label + " " + item.token
-        ) ||
-        /add-to-cart|addtocart|add_to_cart/i.test(item.token)
-      )
-      .sort((first, second) =>
-        Math.abs(first.y - anchorY) -
-        Math.abs(second.y - anchorY)
-      );
-
-    const enabledAdd =
-      cartControls.find(item => item.enabled) || null;
-    const disabledAdd =
-      cartControls.find(item => !item.enabled) || null;
-    const chosenControl = enabledAdd || disabledAdd;
-    const chosenY = chosenControl
-      ? chosenControl.y
-      : anchorY + 800;
-
-    const buyNowControl = allControls.find(item =>
-      item.enabled &&
-      /buy now|checkout now/i.test(
-        item.label + " " + item.token
-      )
+    const enabledAdd = buttons.find(button =>
+      !button.disabled &&
+      button.getAttribute("aria-disabled") !== "true"
     ) || null;
 
-    const offerControls = allControls
-      .filter(item =>
-        /see all buying options|more seller options|choose options|select options|check availability|see options|add to cart/i.test(
-          item.label + " " + item.token
-        )
-      )
-      .slice(0, 15)
-      .map(item => ({
-        label: item.label,
-        token: item.token,
-        enabled: item.enabled,
-        y: item.y,
-      }));
+    const disabledAdd = buttons.find(button =>
+      button.disabled ||
+      button.getAttribute("aria-disabled") === "true"
+    ) || null;
 
-    const availabilityMeta = normalize(
-      document.querySelector('link[itemprop="availability"]')?.href ||
-      document.querySelector('meta[itemprop="availability"]')?.content ||
-      document.querySelector('meta[property="product:availability"]')?.content ||
-      ""
-    );
+    const chosenButton = enabledAdd || disabledAdd;
+    const chosenY = chosenButton
+      ? pageY(chosenButton)
+      : anchorY + 600;
 
     const priceMeta =
       document.querySelector('meta[itemprop="price"]')?.content ||
@@ -851,15 +727,13 @@ function pageEvidenceExpression(itemId) {
         ...main.querySelectorAll(
           '[data-testid*="price"],' +
           '[data-automation-id*="price"],' +
-          '[itemprop="price"],' +
-          '[aria-label*="$"]'
+          '[itemprop="price"]'
         ),
       ]
         .filter(visible)
         .map(element => ({
           text: normalize(
             element.getAttribute("content") ||
-            element.getAttribute("aria-label") ||
             element.textContent
           ),
           y: pageY(element),
@@ -872,8 +746,8 @@ function pageEvidenceExpression(itemId) {
         .filter(item =>
           !item.recommendation &&
           /\\$\\s*\\d/.test(item.text) &&
-          item.y >= anchorY - 300 &&
-          item.y <= anchorY + 1800
+          item.y >= anchorY - 250 &&
+          item.y <= anchorY + 1400
         )
         .sort((first, second) =>
           Math.abs(first.y - anchorY) -
@@ -884,7 +758,7 @@ function pageEvidenceExpression(itemId) {
     }
 
     const atomicTexts = [
-      ...main.querySelectorAll("span, p, div, button, li"),
+      ...main.querySelectorAll("span, p, div, button"),
     ]
       .filter(visible)
       .filter(element =>
@@ -913,14 +787,14 @@ function pageEvidenceExpression(itemId) {
       })
       .filter(item =>
         item.text &&
-        item.text.length <= 240
+        item.text.length <= 180
       );
 
     const exactStockTexts = atomicTexts
       .filter(item =>
-        item.y >= anchorY - 180 &&
-        item.y <= chosenY + 750 &&
-        /low stock|limited stock|few left|only\\s+\\d+\\s+(?:left|remaining|in stock)|\\d+\\s+left in stock|out of stock|sold out|back[\\s-]?order|currently unavailable|item unavailable|no longer available|this item is unavailable/i.test(item.text)
+        item.y >= anchorY - 120 &&
+        item.y <= chosenY + 500 &&
+        /low stock|limited stock|only\\s+\\d+\\s+(?:left|remaining|in stock)|out of stock|sold out|back[\\s-]?order|currently unavailable/i.test(item.text)
       )
       .sort((first, second) =>
         Math.abs(first.y - chosenY) -
@@ -930,27 +804,13 @@ function pageEvidenceExpression(itemId) {
       .filter((value, index, array) =>
         array.indexOf(value) === index
       )
-      .slice(0, 20);
-
-    const purchaseTexts = atomicTexts
-      .filter(item =>
-        item.y >= anchorY - 180 &&
-        item.y <= chosenY + 1100
-      )
-      .map(item => item.text)
-      .filter(text =>
-        /sold and shipped by|fulfilled by|shipping|pickup|delivery|arrives|available|unavailable|in stock|out of stock|add to cart|buy now|seller/i.test(text)
-      )
-      .filter((value, index, array) =>
-        array.indexOf(value) === index
-      )
-      .slice(0, 40);
+      .slice(0, 12);
 
     const fulfillment = {};
 
     for (const label of ["shipping", "pickup", "delivery"]) {
       const labelNodes = [
-        ...main.querySelectorAll("span, p, div, h3, h4, button"),
+        ...main.querySelectorAll("span, p, div, h3, h4"),
       ]
         .filter(visible)
         .filter(element =>
@@ -960,8 +820,8 @@ function pageEvidenceExpression(itemId) {
           const y = pageY(element);
 
           return (
-            y >= anchorY - 150 &&
-            y <= chosenY + 1200 &&
+            y >= anchorY - 100 &&
+            y <= chosenY + 900 &&
             !tokenAncestor(
               element,
               recommendationTokens,
@@ -977,7 +837,7 @@ function pageEvidenceExpression(itemId) {
 
         for (
           let depth = 0;
-          current && depth < 8;
+          current && depth < 7;
           depth += 1, current = current.parentElement
         ) {
           if (!visible(current)) continue;
@@ -986,7 +846,7 @@ function pageEvidenceExpression(itemId) {
 
           if (
             !text ||
-            text.length > 750
+            text.length > 550
           ) {
             continue;
           }
@@ -1031,23 +891,6 @@ function pageEvidenceExpression(itemId) {
       }
     }
 
-    const selectedVariantSignals = [
-      ...main.querySelectorAll(
-        '[aria-checked="true"], [aria-selected="true"], [data-selected="true"], [data-state="selected"]'
-      ),
-    ]
-      .filter(visible)
-      .map(element => normalize(
-        element.getAttribute("aria-label") ||
-        element.getAttribute("title") ||
-        element.textContent
-      ))
-      .filter(Boolean)
-      .filter((value, index, array) =>
-        array.indexOf(value) === index
-      )
-      .slice(0, 20);
-
     const embeddedJsonTexts = [];
     let embeddedTotal = 0;
 
@@ -1060,8 +903,8 @@ function pageEvidenceExpression(itemId) {
 
       if (
         !text.includes(requestedItemId) ||
-        text.length > 3000000 ||
-        embeddedTotal + text.length > 7000000
+        text.length > 2500000 ||
+        embeddedTotal + text.length > 5000000
       ) {
         continue;
       }
@@ -1069,60 +912,23 @@ function pageEvidenceExpression(itemId) {
       embeddedJsonTexts.push(text);
       embeddedTotal += text.length;
 
-      if (embeddedJsonTexts.length >= 16) {
-        break;
-      }
-    }
-
-    const jsonLdTexts = [];
-
-    for (
-      const script of document.querySelectorAll(
-        'script[type="application/ld+json"]'
-      )
-    ) {
-      const text = script.textContent || "";
-
-      if (
-        !text ||
-        text.length > 1500000
-      ) {
-        continue;
-      }
-
-      jsonLdTexts.push(text);
-
-      if (jsonLdTexts.length >= 12) {
+      if (embeddedJsonTexts.length >= 12) {
         break;
       }
     }
 
     const bodyText = normalize(
       document.body?.innerText || ""
-    ).slice(0, 30000);
+    ).slice(0, 20000);
 
     return {
       title,
       priceText,
-      availabilityMeta,
       enabledAdd: Boolean(enabledAdd),
       disabledAdd: Boolean(disabledAdd),
-      buyNowEnabled: Boolean(buyNowControl),
-      cartControlLabel:
-        enabledAdd?.label ||
-        disabledAdd?.label ||
-        "",
-      cartControlToken:
-        enabledAdd?.token ||
-        disabledAdd?.token ||
-        "",
-      offerControls,
       exactStockTexts,
-      purchaseTexts,
       fulfillment,
-      selectedVariantSignals,
       embeddedJsonTexts,
-      jsonLdTexts,
       bodyText,
       pageUrl: location.href,
     };
@@ -1130,37 +936,33 @@ function pageEvidenceExpression(itemId) {
 }
 
 function domStock(dom) {
-  // Exact selected-offer warnings have priority over generic metadata, but a
-  // valid purchase control has priority over secondary fulfillment failures.
   for (const text of dom.exactStockTexts || []) {
     const state = stockFromText(text);
 
     if (
       state === STOCK.LOW_STOCK ||
       state === STOCK.LIMITED_STOCK ||
-      state === STOCK.QUANTITY
+      state === STOCK.QUANTITY ||
+      state === STOCK.OOS
     ) {
       return {
         stock: state,
         evidence: text,
-        strength: "strong",
-        source: "exact_selected_offer_warning",
       };
     }
   }
 
-  if (
-    dom.enabledAdd ||
-    dom.buyNowEnabled
-  ) {
+  if (dom.enabledAdd) {
     return {
       stock: STOCK.IN_STOCK,
-      evidence:
-        dom.enabledAdd
-          ? `Enabled purchase control: ${dom.cartControlLabel || "Add to cart"}`
-          : "Enabled Buy now control",
-      strength: "strong",
-      source: "enabled_primary_purchase_control",
+      evidence: "Enabled primary Add to cart",
+    };
+  }
+
+  if (dom.disabledAdd) {
+    return {
+      stock: STOCK.OOS,
+      evidence: "Disabled primary Add to cart",
     };
   }
 
@@ -1169,7 +971,7 @@ function domStock(dom) {
   ).map(([method, text]) => ({
     method,
     text,
-    stock: fulfillmentStockFromText(text),
+    stock: stockFromText(text),
   }));
 
   const available = fulfillment.filter(
@@ -1182,171 +984,31 @@ function domStock(dom) {
       evidence: available
         .map(item => `${item.method}: ${item.text}`)
         .join(" | "),
-      strength: "medium",
-      source: "available_fulfillment_method",
     };
   }
-
-  for (const text of dom.exactStockTexts || []) {
-    const state = stockFromText(text);
-    const normalizedText = normalizeText(text).toLowerCase();
-    const methodSpecific = fulfillment.some(item => {
-      const fulfillmentText = normalizeText(item.text).toLowerCase();
-      return (
-        fulfillmentText.includes(normalizedText) ||
-        /\b(?:shipping|pickup|delivery)\b/.test(normalizedText)
-      );
-    });
-
-    if (state === STOCK.OOS && !methodSpecific) {
-      return {
-        stock: STOCK.OOS,
-        evidence: text,
-        strength: "strong",
-        source: "explicit_selected_offer_oos",
-      };
-    }
-  }
-
-  const availabilityMetaState = stockFromText(
-    dom.availabilityMeta || ""
-  );
-
-  if (availabilityMetaState === STOCK.IN_STOCK) {
-    return {
-      stock: STOCK.IN_STOCK,
-      evidence:
-        `Availability metadata: ${dom.availabilityMeta}`,
-      strength: "medium",
-      source: "availability_metadata",
-    };
-  }
-
-  const enabledBuyingOptions = (
-    dom.offerControls || []
-  ).some(item =>
-    item.enabled &&
-    /see all buying options|more seller options|see options|choose options|select options/i.test(
-      `${item.label} ${item.token}`
-    )
-  );
-
-  // A disabled cart button alone is not reliable. Walmart temporarily
-  // disables buttons during seller, location, and fulfillment refreshes.
-  if (enabledBuyingOptions) {
-    return {
-      stock: STOCK.UNKNOWN,
-      evidence: "Enabled buying-options control is available.",
-      strength: "none",
-      source: "buying_options_require_selection",
-    };
-  }
-
-  const unavailable = fulfillment.filter(
-    item => item.stock === STOCK.OOS
-  );
 
   if (
     fulfillment.length >= 2 &&
-    unavailable.length === fulfillment.length &&
-    availabilityMetaState === STOCK.OOS
+    fulfillment.every(item => item.stock === STOCK.OOS)
   ) {
     return {
       stock: STOCK.OOS,
       evidence: fulfillment
         .map(item => `${item.method}: ${item.text}`)
         .join(" | "),
-      strength: "medium",
-      source: "all_fulfillment_unavailable_with_oos_metadata",
-    };
-  }
-
-  if (availabilityMetaState === STOCK.OOS) {
-    return {
-      stock: STOCK.OOS,
-      evidence:
-        `Availability metadata: ${dom.availabilityMeta}`,
-      strength: "medium",
-      source: "availability_metadata_oos",
     };
   }
 
   return {
     stock: STOCK.UNKNOWN,
-    evidence: "",
-    strength: "none",
-    source: "none",
-  };
-}
-
-function structuredConsensus(structured) {
-  const candidates = (
-    structured?.candidates || []
-  ).filter(candidate =>
-    candidate.stock &&
-    candidate.stock !== STOCK.UNKNOWN &&
-    candidate.score >= 125
-  );
-
-  if (!candidates.length) {
-    return {
-      stock: STOCK.UNKNOWN,
-      count: 0,
-      total: 0,
-      evidence: "",
-    };
-  }
-
-  const counts = new Map();
-
-  for (const candidate of candidates) {
-    counts.set(
-      candidate.stock,
-      (counts.get(candidate.stock) || 0) + 1
-    );
-  }
-
-  const ordered = [...counts.entries()]
-    .sort((first, second) =>
-      second[1] - first[1]
-    );
-
-  const [stock, count] = ordered[0];
-  const topScore = candidates
-    .filter(candidate => candidate.stock === stock)
-    .reduce(
-      (maximum, candidate) => Math.max(maximum, candidate.score),
-      0
-    );
-  const ratio = count / candidates.length;
-
-  const accepted =
-    (count >= 2 && ratio >= 0.67) ||
-    (stock === STOCK.IN_STOCK && topScore >= 165) ||
-    (stock === STOCK.OOS && topScore >= 180);
-
-  if (accepted) {
-    return {
-      stock,
-      count,
-      total: candidates.length,
-      evidence:
-        `${count}/${candidates.length} high-confidence exact-item candidate(s) support ${stock}`,
-    };
-  }
-
-  return {
-    stock: STOCK.UNKNOWN,
-    count,
-    total: candidates.length,
     evidence: "",
   };
 }
 
 function finalDecision(structured, dom) {
   const domResult = domStock(dom);
-  const consensus = structuredConsensus(structured);
-  const structuredStock = consensus.stock;
+  const structuredStock =
+    structured?.stock || STOCK.UNKNOWN;
 
   if (
     domResult.stock === STOCK.LOW_STOCK ||
@@ -1358,86 +1020,53 @@ function finalDecision(structured, dom) {
       reason:
         `The exact linked item's selected offer reports: ` +
         `${domResult.evidence}.`,
-      domResult,
-      consensus,
-    };
-  }
-
-  if (
-    domResult.stock === STOCK.IN_STOCK &&
-    domResult.strength === "strong"
-  ) {
-    return {
-      stock: STOCK.IN_STOCK,
-      reason:
-        `The exact linked item's primary purchase area reports ` +
-        `In Stock: ${domResult.evidence}.`,
-      domResult,
-      consensus,
     };
   }
 
   if (
     domResult.stock === STOCK.OOS &&
-    domResult.strength === "strong"
+    !dom.enabledAdd
   ) {
     return {
       stock: STOCK.OOS,
       reason:
-        `The exact linked item's selected offer explicitly reports OOS: ` +
+        `The exact linked item's selected offer reports OOS: ` +
         `${domResult.evidence}.`,
-      domResult,
-      consensus,
     };
   }
 
   if (
     domResult.stock === STOCK.IN_STOCK &&
-    domResult.strength === "medium"
+    dom.enabledAdd
   ) {
     return {
       stock: STOCK.IN_STOCK,
       reason:
-        `At least one valid fulfillment method is available for the exact item: ` +
-        `${domResult.evidence}.`,
-      domResult,
-      consensus,
+        "The exact linked item's primary offer has an enabled " +
+        "Add to cart control.",
     };
   }
 
   if (
-    domResult.stock === STOCK.OOS &&
-    domResult.strength === "medium"
-  ) {
-    if (structuredStock === STOCK.OOS) {
-      return {
-        stock: STOCK.OOS,
-        reason:
-          "The selected purchase area and high-confidence exact-item data agree that the item is OOS.",
-        domResult,
-        consensus,
-      };
-    }
-
-    return {
-      stock: STOCK.UNKNOWN,
-      reason:
-        "Walmart shows unavailable fulfillment or OOS metadata, but no explicit selected-offer OOS proof was found.",
-      domResult,
-      consensus,
-    };
-  }
-
-  if (
-    domResult.stock === STOCK.UNKNOWN &&
-    structuredStock !== STOCK.UNKNOWN
+    structuredStock !== STOCK.UNKNOWN &&
+    domResult.stock === STOCK.UNKNOWN
   ) {
     return {
       stock: structuredStock,
       reason:
-        `High-confidence exact-item Walmart data supplied the stock result: ${consensus.evidence}.`,
-      domResult,
-      consensus,
+        "Exact-item structured Walmart data supplied the stock result.",
+    };
+  }
+
+  if (
+    structuredStock === STOCK.UNKNOWN &&
+    domResult.stock !== STOCK.UNKNOWN
+  ) {
+    return {
+      stock: domResult.stock,
+      reason:
+        "The exact linked item's primary purchase area supplied " +
+        `the stock result: ${domResult.evidence}.`,
     };
   }
 
@@ -1448,33 +1077,16 @@ function finalDecision(structured, dom) {
     return {
       stock: structuredStock,
       reason:
-        "Exact-item Walmart offer data and the selected purchase area agree.",
-      domResult,
-      consensus,
-    };
-  }
-
-  if (
-    structuredStock !== STOCK.UNKNOWN &&
-    domResult.stock !== STOCK.UNKNOWN &&
-    structuredStock !== domResult.stock
-  ) {
-    return {
-      stock: STOCK.UNKNOWN,
-      reason:
-        "Walmart's selected purchase area and high-confidence exact-item data disagree " +
-        `(${domResult.stock} versus ${structuredStock}).`,
-      domResult,
-      consensus,
+        "Exact-item structured data and the selected purchase " +
+        "area agree.",
     };
   }
 
   return {
     stock: STOCK.UNKNOWN,
     reason:
-      "The exact Walmart item did not provide one reliable stock state without guessing.",
-    domResult,
-    consensus,
+      "The exact Walmart item did not provide one reliable stock " +
+      `state (${structuredStock} versus ${domResult.stock}).`,
   };
 }
 
@@ -1766,121 +1378,6 @@ async function preserveMinimizedWindow(
   ).catch(() => {});
 }
 
-function addDomJsonBodies(jsonBodies, dom) {
-  for (const text of dom.embeddedJsonTexts || []) {
-    try {
-      jsonBodies.push({
-        url: "embedded://page-json",
-        json: JSON.parse(text),
-      });
-    } catch {
-      // Ignore unreadable embedded data.
-    }
-  }
-
-  for (const text of dom.jsonLdTexts || []) {
-    try {
-      jsonBodies.push({
-        url: "embedded://json-ld",
-        json: JSON.parse(text),
-      });
-    } catch {
-      // Ignore unreadable JSON-LD.
-    }
-  }
-}
-
-async function triggerPurchaseAreaLoad(
-  client,
-  sessionId
-) {
-  await evaluate(
-    client,
-    sessionId,
-    `(() => {
-      const normalize = value =>
-        String(value || "").replace(/\\s+/g, " ").trim();
-
-      const visible = element => {
-        if (!element) return false;
-        const style = getComputedStyle(element);
-        const rect = element.getBoundingClientRect();
-
-        return (
-          style.display !== "none" &&
-          style.visibility !== "hidden" &&
-          rect.width > 0 &&
-          rect.height > 0
-        );
-      };
-
-      const main =
-        document.querySelector("main") ||
-        document.querySelector('[role="main"]') ||
-        document.body;
-
-      const controls = [
-        ...main.querySelectorAll(
-          'button, [role="button"], input, a'
-        ),
-      ].filter(visible);
-
-      const purchase = controls.find(element =>
-        /add to cart|add to basket|buy now|see all buying options|choose options|select options|check availability/i.test(
-          normalize(
-            element.getAttribute("aria-label") ||
-            element.getAttribute("title") ||
-            element.value ||
-            element.textContent
-          )
-        )
-      );
-
-      const heading = [
-        ...main.querySelectorAll("h1"),
-      ].filter(visible)[0];
-
-      const target =
-        purchase ||
-        heading ||
-        main;
-
-      target.scrollIntoView({
-        block: "center",
-        inline: "nearest",
-        behavior: "instant",
-      });
-
-      window.dispatchEvent(new Event("scroll"));
-      window.dispatchEvent(new Event("resize"));
-
-      return true;
-    })()`,
-    15000
-  ).catch(() => {});
-}
-
-async function collectDomPass(
-  client,
-  sessionId,
-  itemId,
-  jsonBodies
-) {
-  const dom = await evaluate(
-    client,
-    sessionId,
-    pageEvidenceExpression(itemId),
-    30000
-  );
-
-  addDomJsonBodies(
-    jsonBodies,
-    dom
-  );
-
-  return dom;
-}
-
 async function main() {
   const request = await readStdin();
   const url = normalizeText(request.url);
@@ -2108,13 +1605,11 @@ async function main() {
       windowProtection
     );
 
-    const attempts = [];
-
-    let dom = await collectDomPass(
+    const dom = await evaluate(
       client,
       sessionId,
-      itemId,
-      jsonBodies
+      pageEvidenceExpression(itemId),
+      25000
     );
 
     if (
@@ -2124,151 +1619,24 @@ async function main() {
     ) {
       throw new Error(
         "Walmart requested human verification in Brave. " +
-        "Complete it in the dedicated Walmart tab, then retry."
+        "Complete it in the temporary Walmart tab, then retry."
       );
+    }
+
+    for (const text of dom.embeddedJsonTexts || []) {
+      try {
+        jsonBodies.push({
+          url: "embedded://page-json",
+          json: JSON.parse(text),
+        });
+      } catch {
+        // Ignore unreadable embedded data.
+      }
     }
 
     await Promise.allSettled(
       [...bodyPromises]
     );
-
-    let structured = bestStructuredEvidence(
-      jsonBodies,
-      itemId
-    );
-    let decision = finalDecision(
-      structured,
-      dom
-    );
-
-    attempts.push({
-      name: "initial",
-      decision,
-      dom: {
-        enabledAdd: dom.enabledAdd,
-        disabledAdd: dom.disabledAdd,
-        buyNowEnabled: dom.buyNowEnabled,
-        availabilityMeta: dom.availabilityMeta,
-        exactStockTexts: dom.exactStockTexts,
-        fulfillment: dom.fulfillment,
-      },
-    });
-
-    if (decision.stock === STOCK.UNKNOWN) {
-      await triggerPurchaseAreaLoad(
-        client,
-        sessionId
-      );
-
-      await preserveMinimizedWindow(
-        client,
-        windowProtection
-      );
-
-      await sleep(3000);
-
-      dom = await collectDomPass(
-        client,
-        sessionId,
-        itemId,
-        jsonBodies
-      );
-
-      await Promise.allSettled(
-        [...bodyPromises]
-      );
-
-      structured = bestStructuredEvidence(
-        jsonBodies,
-        itemId
-      );
-      decision = finalDecision(
-        structured,
-        dom
-      );
-
-      attempts.push({
-        name: "purchase-area-retry",
-        decision,
-        dom: {
-          enabledAdd: dom.enabledAdd,
-          disabledAdd: dom.disabledAdd,
-          buyNowEnabled: dom.buyNowEnabled,
-          availabilityMeta: dom.availabilityMeta,
-          exactStockTexts: dom.exactStockTexts,
-          fulfillment: dom.fulfillment,
-        },
-      });
-    }
-
-    if (decision.stock === STOCK.UNKNOWN) {
-      await client.send(
-        "Page.reload",
-        {
-          ignoreCache: false,
-        },
-        sessionId,
-        config.navigation_timeout_ms
-      );
-
-      await preserveMinimizedWindow(
-        client,
-        windowProtection
-      );
-
-      await waitForPage(
-        client,
-        sessionId,
-        {},
-        config.navigation_timeout_ms,
-        config.settle_timeout_ms
-      );
-
-      await preserveMinimizedWindow(
-        client,
-        windowProtection
-      );
-
-      await triggerPurchaseAreaLoad(
-        client,
-        sessionId
-      );
-
-      await sleep(2500);
-
-      dom = await collectDomPass(
-        client,
-        sessionId,
-        itemId,
-        jsonBodies
-      );
-
-      await Promise.allSettled(
-        [...bodyPromises]
-      );
-
-      structured = bestStructuredEvidence(
-        jsonBodies,
-        itemId
-      );
-      decision = finalDecision(
-        structured,
-        dom
-      );
-
-      attempts.push({
-        name: "reload-retry",
-        decision,
-        dom: {
-          enabledAdd: dom.enabledAdd,
-          disabledAdd: dom.disabledAdd,
-          buyNowEnabled: dom.buyNowEnabled,
-          availabilityMeta: dom.availabilityMeta,
-          exactStockTexts: dom.exactStockTexts,
-          fulfillment: dom.fulfillment,
-        },
-      });
-    }
 
     const finalPageItemId = exactItemId(
       dom.pageUrl
@@ -2283,6 +1651,15 @@ async function main() {
         `item ${finalPageItemId}.`
       );
     }
+
+    const structured = bestStructuredEvidence(
+      jsonBodies,
+      itemId
+    );
+    const decision = finalDecision(
+      structured.best,
+      dom
+    );
 
     const title =
       dom.title ||
@@ -2323,23 +1700,13 @@ async function main() {
         pageUrl: dom.pageUrl,
         structuredBest: structured.best,
         structuredCandidates: structured.candidates,
-        structuredConsensus:
-          decision.consensus || null,
-        attempts,
         dom: {
           title: dom.title,
           priceText: dom.priceText,
-          availabilityMeta: dom.availabilityMeta,
           enabledAdd: dom.enabledAdd,
           disabledAdd: dom.disabledAdd,
-          buyNowEnabled: dom.buyNowEnabled,
-          cartControlLabel: dom.cartControlLabel,
-          cartControlToken: dom.cartControlToken,
-          offerControls: dom.offerControls,
           exactStockTexts: dom.exactStockTexts,
-          purchaseTexts: dom.purchaseTexts,
           fulfillment: dom.fulfillment,
-          selectedVariantSignals: dom.selectedVariantSignals,
         },
       },
     };
@@ -2416,26 +1783,6 @@ function selfTest() {
       STOCK.OOS,
     ],
     [
-      stockFromText("https://schema.org/InStock"),
-      STOCK.IN_STOCK,
-    ],
-    [
-      stockFromText("https://schema.org/OutOfStock"),
-      STOCK.OOS,
-    ],
-    [
-      stockFromText("Delivery Not available"),
-      STOCK.UNKNOWN,
-    ],
-    [
-      fulfillmentStockFromText("Delivery Not available"),
-      STOCK.OOS,
-    ],
-    [
-      fulfillmentStockFromText("Shipping available, arrives tomorrow"),
-      STOCK.IN_STOCK,
-    ],
-    [
       normalizePrice("$1,299.99"),
       "1299.99",
     ],
@@ -2449,88 +1796,6 @@ function selfTest() {
     }
   }
 
-  const enabledCartDecision = finalDecision(
-    { candidates: [] },
-    {
-      enabledAdd: true,
-      buyNowEnabled: false,
-      cartControlLabel: "Add to cart",
-      exactStockTexts: [],
-      fulfillment: {
-        shipping: "Shipping available, arrives tomorrow",
-        delivery: "Delivery Not available",
-      },
-      availabilityMeta: "https://schema.org/OutOfStock",
-      offerControls: [],
-    }
-  );
-
-  if (enabledCartDecision.stock !== STOCK.IN_STOCK) {
-    throw new Error(
-      "Self-test failed: enabled Add to cart must override unavailable delivery."
-    );
-  }
-
-  const unavailableDeliveryOnly = finalDecision(
-    { candidates: [] },
-    {
-      enabledAdd: false,
-      buyNowEnabled: false,
-      disabledAdd: true,
-      exactStockTexts: [],
-      fulfillment: {
-        delivery: "Delivery Not available",
-      },
-      availabilityMeta: "",
-      offerControls: [],
-    }
-  );
-
-  if (unavailableDeliveryOnly.stock !== STOCK.UNKNOWN) {
-    throw new Error(
-      "Self-test failed: one unavailable fulfillment method must not become product OOS."
-    );
-  }
-
-  const shippingAvailableDecision = finalDecision(
-    { candidates: [] },
-    {
-      enabledAdd: false,
-      buyNowEnabled: false,
-      exactStockTexts: ["Out of stock"],
-      fulfillment: {
-        shipping: "Shipping available, arrives tomorrow",
-        delivery: "Delivery Not available",
-      },
-      availabilityMeta: "",
-      offerControls: [],
-    }
-  );
-
-  if (shippingAvailableDecision.stock !== STOCK.IN_STOCK) {
-    throw new Error(
-      "Self-test failed: available shipping must override an unavailable secondary method."
-    );
-  }
-
-  const explicitOosDecision = finalDecision(
-    { candidates: [] },
-    {
-      enabledAdd: false,
-      buyNowEnabled: false,
-      exactStockTexts: ["Out of stock"],
-      fulfillment: {},
-      availabilityMeta: "",
-      offerControls: [],
-    }
-  );
-
-  if (explicitOosDecision.stock !== STOCK.OOS) {
-    throw new Error(
-      "Self-test failed: explicit selected-offer OOS must remain OOS."
-    );
-  }
-
   if (
     !scraperTabStatePath("C:/test")
       .replace(/\\/g, "/")
@@ -2542,7 +1807,7 @@ function selfTest() {
   }
 
   process.stdout.write(
-    "Walmart v8 conservative availability runtime self-test passed.\n"
+    "Walmart background Brave CDP runtime self-test passed.\n"
   );
 }
 

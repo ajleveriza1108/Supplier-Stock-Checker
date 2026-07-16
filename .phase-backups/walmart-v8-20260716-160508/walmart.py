@@ -1,14 +1,10 @@
-"""Walmart exact-item scraper bridge.
+"""Walmart scraper compatibility bridge.
 
-The extraction runtime is implemented in Node.js and connects to the existing
-Brave remote-debug browser. This bridge preserves the six-value interface used
-by Supplier Stock Checker.
+The actual Walmart extraction is implemented in Node.js with Playwright under
+``scrapers/walmart_runtime``. This Python class preserves the interface used by
+the existing Supplier Stock Checker engine.
 
-Version 8.1:
-- decodes Node output explicitly as UTF-8;
-- replaces undecodable characters instead of crashing reader threads;
-- preserves detailed runtime errors in a local diagnostic log;
-- does not use the legacy Walmart policy or double-check modules.
+Legacy Walmart policy and double-check modules are intentionally not used.
 """
 
 from __future__ import annotations
@@ -16,15 +12,16 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 
-WALMART_SCRAPER_VERSION = "2026.07.16.false-oos-unicode-v8.1"
+WALMART_SCRAPER_VERSION = "2026.07.16.scratch-v1"
 
 
 class WalmartScraper:
-    """Run the exact-item Walmart Brave CDP extractor."""
+    """Run the exact-item Walmart Playwright extractor."""
 
     def __init__(
         self,
@@ -32,6 +29,8 @@ class WalmartScraper:
         logger_func: Any = None,
         **_: Any,
     ) -> None:
+        # Kept only for compatibility with ui/app.py. Walmart no longer
+        # attaches to the user's signed-in Brave/Chrome profile.
         self.browser_manager = browser_manager
         self.log = logger_func
         self.project_root = Path(__file__).resolve().parents[1]
@@ -60,14 +59,14 @@ class WalmartScraper:
         if not self.runner.is_file():
             return self._error(
                 url,
-                "Walmart runtime is missing. Reinstall the Walmart repair.",
+                "Walmart runtime is missing. Reinstall the Walmart scratch rewrite.",
             )
 
         node = self._find_node()
         if not node:
             return self._error(
                 url,
-                "Node.js was not found. Install Node.js LTS and restart the app.",
+                "Node.js was not found. Install Node.js LTS, then run the Walmart setup script.",
             )
 
         request = {
@@ -81,7 +80,6 @@ class WalmartScraper:
 
         creation_flags = 0
         startup_info = None
-
         if os.name == "nt":
             creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             startup_info = subprocess.STARTUPINFO()
@@ -92,8 +90,6 @@ class WalmartScraper:
                 [node, str(self.runner)],
                 input=json.dumps(request),
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 capture_output=True,
                 timeout=timeout_seconds,
                 cwd=str(self.project_root),
@@ -102,7 +98,6 @@ class WalmartScraper:
                 env={
                     **os.environ,
                     "NODE_NO_WARNINGS": "1",
-                    "PYTHONUTF8": "1",
                 },
             )
         except subprocess.TimeoutExpired:
@@ -120,22 +115,14 @@ class WalmartScraper:
         stderr = (completed.stderr or "").strip()
 
         if completed.returncode != 0:
-            detail = (
-                stderr
-                or stdout
-                or "The Walmart runtime closed unexpectedly."
-            )
-            return self._error(url, detail[:1200])
+            detail = stderr or stdout or "The Walmart runtime closed unexpectedly."
+            return self._error(url, detail[:700])
 
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError:
-            detail = (
-                stderr
-                or stdout
-                or "The Walmart runtime returned unreadable data."
-            )
-            return self._error(url, detail[:1200])
+            detail = stderr or stdout or "The Walmart runtime returned unreadable data."
+            return self._error(url, detail[:700])
 
         if not isinstance(payload, dict):
             return self._error(
@@ -154,9 +141,7 @@ class WalmartScraper:
         if status != "Success":
             return self._error(
                 url,
-                reason
-                or stock
-                or "Walmart could not verify the exact item.",
+                reason or stock or "Walmart could not verify the exact item.",
                 title=title,
                 evidence=evidence,
             )
@@ -175,7 +160,7 @@ class WalmartScraper:
                 "price": price,
                 "stock": stock,
                 "item_id": item_id,
-                "source": "walmart_brave_cdp_exact_item",
+                "source": "walmart_playwright_exact_item",
                 "evidence": evidence,
             }
         ]
@@ -185,8 +170,7 @@ class WalmartScraper:
                 (
                     "Walmart exact-item extractor: "
                     f"item {item_id or 'unknown'} | "
-                    f"price {price or 'not shown'} | "
-                    f"stock {stock}."
+                    f"price {price or 'not shown'} | stock {stock}."
                 ),
                 "info",
                 url,
@@ -200,21 +184,11 @@ class WalmartScraper:
 
     def _timeout_seconds(self) -> int:
         default = 90
-
         try:
-            data = json.loads(
-                self.config_path.read_text(encoding="utf-8")
-            )
-            value = int(
-                data.get("process_timeout_seconds", default)
-            )
+            data = json.loads(self.config_path.read_text(encoding="utf-8"))
+            value = int(data.get("process_timeout_seconds", default))
             return max(30, min(300, value))
-        except (
-            OSError,
-            ValueError,
-            TypeError,
-            json.JSONDecodeError,
-        ):
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return default
 
     @staticmethod
@@ -238,44 +212,17 @@ class WalmartScraper:
         list[dict[str, Any]],
         list[tuple[str, str, str]],
     ]:
-        safe_message = str(
-            message or "Unable to verify Walmart item."
-        ).strip()
-
-        try:
-            project_root = Path(__file__).resolve().parents[1]
-            log_path = (
-                project_root
-                / "logs"
-                / "walmart_runtime_errors.log"
-            )
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-
-            with log_path.open(
-                "a",
-                encoding="utf-8",
-                errors="replace",
-            ) as handle:
-                handle.write(
-                    f"URL: {url}\n"
-                    f"ERROR: {safe_message}\n"
-                    + ("-" * 80)
-                    + "\n"
-                )
-        except OSError:
-            pass
-
+        safe_message = str(message or "Unable to verify Walmart item.").strip()
         variants = [
             {
                 "label": "Exact linked item",
                 "price": "",
                 "stock": "Unable to Verify",
-                "source": "walmart_brave_cdp_exact_item",
+                "source": "walmart_playwright_exact_item",
                 "evidence": evidence or {},
                 "reason": safe_message,
             }
         ]
-
         return (
             "Error",
             "",

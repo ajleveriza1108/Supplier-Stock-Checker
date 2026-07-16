@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-const VERSION = "2026.07.16.false-oos-unicode-v8";
+const VERSION = "2026.07.16.variant-offer-v7";
 
 const STOCK = Object.freeze({
   IN_STOCK: "In Stock",
@@ -80,11 +80,8 @@ function stockFromText(value) {
     return STOCK.UNKNOWN;
   }
 
-  // This function is for the overall selected item/offer only. Generic
-  // phrases such as "not available" are deliberately excluded because they
-  // commonly describe only pickup or delivery while shipping remains valid.
   if (
-    /back[\s-]?order|sold out|out of stock|currently unavailable|item unavailable|no longer available|this item is unavailable|schema org out of stock/.test(
+    /back[\s-]?order|sold out|out of stock|currently unavailable|item unavailable|not available|unavailable for (?:shipping|pickup|delivery)|schema org out of stock/.test(
       text
     )
   ) {
@@ -108,60 +105,14 @@ function stockFromText(value) {
   }
 
   if (
-    /\bin stock\b|schema org in stock/.test(text)
-  ) {
-    return STOCK.IN_STOCK;
-  }
-
-  return STOCK.UNKNOWN;
-}
-
-function structuredStockFromText(value) {
-  const text = normalizeText(value)
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/[_/.:?-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .toLowerCase()
-    .trim();
-
-  if (/^(?:out of stock|sold out|not available|unavailable|backorder|back order)$/.test(text)) {
-    return STOCK.OOS;
-  }
-
-  if (/^(?:in stock|available)$/.test(text)) {
-    return STOCK.IN_STOCK;
-  }
-
-  return stockFromText(text);
-}
-
-function fulfillmentStockFromText(value) {
-  const text = normalizeText(value)
-    .replace(/([a-z])([A-Z])/g, "$1 $2")
-    .replace(/[_/.:?-]+/g, " ")
-    .replace(/\s+/g, " ")
-    .toLowerCase()
-    .trim();
-
-  if (!text) {
-    return STOCK.UNKNOWN;
-  }
-
-  if (
-    /not available|unavailable|not offered|not eligible|cannot be shipped|can(?:not|'t) deliver|no pickup/.test(text)
-  ) {
-    return STOCK.OOS;
-  }
-
-  if (
-    /available for shipping|shipping available|available for delivery|delivery available|available for pickup|pickup available|arrives (?:today|tomorrow|by)|delivery (?:today|tomorrow|by)|pickup (?:today|tomorrow|ready)|ship(?:s|ping) (?:today|tomorrow|by)/.test(
+    /\bin stock\b|available for shipping|shipping available|available for delivery|delivery available|available for pickup|pickup available|schema org in stock/.test(
       text
     )
   ) {
     return STOCK.IN_STOCK;
   }
 
-  return stockFromText(text);
+  return STOCK.UNKNOWN;
 }
 
 function readStdin() {
@@ -920,7 +871,7 @@ function pageEvidenceExpression(itemId) {
       .filter(item =>
         item.y >= anchorY - 180 &&
         item.y <= chosenY + 750 &&
-        /low stock|limited stock|few left|only\\s+\\d+\\s+(?:left|remaining|in stock)|\\d+\\s+left in stock|out of stock|sold out|back[\\s-]?order|currently unavailable|item unavailable|no longer available|this item is unavailable/i.test(item.text)
+        /low stock|limited stock|few left|only\\s+\\d+\\s+(?:left|remaining|in stock)|\\d+\\s+left in stock|out of stock|sold out|back[\\s-]?order|currently unavailable|item unavailable|not available|available for shipping|available for delivery|available for pickup|shipping available|delivery available|pickup available/i.test(item.text)
       )
       .sort((first, second) =>
         Math.abs(first.y - chosenY) -
@@ -1130,21 +1081,34 @@ function pageEvidenceExpression(itemId) {
 }
 
 function domStock(dom) {
-  // Exact selected-offer warnings have priority over generic metadata, but a
-  // valid purchase control has priority over secondary fulfillment failures.
+  const availabilityMetaState = stockFromText(
+    dom.availabilityMeta || ""
+  );
+
+  if (
+    availabilityMetaState !== STOCK.UNKNOWN
+  ) {
+    return {
+      stock: availabilityMetaState,
+      evidence:
+        `Availability metadata: ${dom.availabilityMeta}`,
+      strength: "strong",
+    };
+  }
+
   for (const text of dom.exactStockTexts || []) {
     const state = stockFromText(text);
 
     if (
       state === STOCK.LOW_STOCK ||
       state === STOCK.LIMITED_STOCK ||
-      state === STOCK.QUANTITY
+      state === STOCK.QUANTITY ||
+      state === STOCK.OOS
     ) {
       return {
         stock: state,
         evidence: text,
         strength: "strong",
-        source: "exact_selected_offer_warning",
       };
     }
   }
@@ -1160,7 +1124,23 @@ function domStock(dom) {
           ? `Enabled purchase control: ${dom.cartControlLabel || "Add to cart"}`
           : "Enabled Buy now control",
       strength: "strong",
-      source: "enabled_primary_purchase_control",
+    };
+  }
+
+  if (
+    dom.disabledAdd &&
+    !(dom.offerControls || []).some(
+      item => item.enabled &&
+      /see all buying options|more seller options|see options/i.test(
+        item.label + " " + item.token
+      )
+    )
+  ) {
+    return {
+      stock: STOCK.OOS,
+      evidence:
+        `Disabled purchase control: ${dom.cartControlLabel || "Add to cart"}`,
+      strength: "medium",
     };
   }
 
@@ -1169,7 +1149,7 @@ function domStock(dom) {
   ).map(([method, text]) => ({
     method,
     text,
-    stock: fulfillmentStockFromText(text),
+    stock: stockFromText(text),
   }));
 
   const available = fulfillment.filter(
@@ -1183,62 +1163,6 @@ function domStock(dom) {
         .map(item => `${item.method}: ${item.text}`)
         .join(" | "),
       strength: "medium",
-      source: "available_fulfillment_method",
-    };
-  }
-
-  for (const text of dom.exactStockTexts || []) {
-    const state = stockFromText(text);
-    const normalizedText = normalizeText(text).toLowerCase();
-    const methodSpecific = fulfillment.some(item => {
-      const fulfillmentText = normalizeText(item.text).toLowerCase();
-      return (
-        fulfillmentText.includes(normalizedText) ||
-        /\b(?:shipping|pickup|delivery)\b/.test(normalizedText)
-      );
-    });
-
-    if (state === STOCK.OOS && !methodSpecific) {
-      return {
-        stock: STOCK.OOS,
-        evidence: text,
-        strength: "strong",
-        source: "explicit_selected_offer_oos",
-      };
-    }
-  }
-
-  const availabilityMetaState = stockFromText(
-    dom.availabilityMeta || ""
-  );
-
-  if (availabilityMetaState === STOCK.IN_STOCK) {
-    return {
-      stock: STOCK.IN_STOCK,
-      evidence:
-        `Availability metadata: ${dom.availabilityMeta}`,
-      strength: "medium",
-      source: "availability_metadata",
-    };
-  }
-
-  const enabledBuyingOptions = (
-    dom.offerControls || []
-  ).some(item =>
-    item.enabled &&
-    /see all buying options|more seller options|see options|choose options|select options/i.test(
-      `${item.label} ${item.token}`
-    )
-  );
-
-  // A disabled cart button alone is not reliable. Walmart temporarily
-  // disables buttons during seller, location, and fulfillment refreshes.
-  if (enabledBuyingOptions) {
-    return {
-      stock: STOCK.UNKNOWN,
-      evidence: "Enabled buying-options control is available.",
-      strength: "none",
-      source: "buying_options_require_selection",
     };
   }
 
@@ -1248,8 +1172,7 @@ function domStock(dom) {
 
   if (
     fulfillment.length >= 2 &&
-    unavailable.length === fulfillment.length &&
-    availabilityMetaState === STOCK.OOS
+    unavailable.length === fulfillment.length
   ) {
     return {
       stock: STOCK.OOS,
@@ -1257,25 +1180,25 @@ function domStock(dom) {
         .map(item => `${item.method}: ${item.text}`)
         .join(" | "),
       strength: "medium",
-      source: "all_fulfillment_unavailable_with_oos_metadata",
     };
   }
 
-  if (availabilityMetaState === STOCK.OOS) {
-    return {
-      stock: STOCK.OOS,
-      evidence:
-        `Availability metadata: ${dom.availabilityMeta}`,
-      strength: "medium",
-      source: "availability_metadata_oos",
-    };
+  for (const text of dom.purchaseTexts || []) {
+    const state = stockFromText(text);
+
+    if (state !== STOCK.UNKNOWN) {
+      return {
+        stock: state,
+        evidence: text,
+        strength: "weak",
+      };
+    }
   }
 
   return {
     stock: STOCK.UNKNOWN,
     evidence: "",
     strength: "none",
-    source: "none",
   };
 }
 
@@ -1285,14 +1208,13 @@ function structuredConsensus(structured) {
   ).filter(candidate =>
     candidate.stock &&
     candidate.stock !== STOCK.UNKNOWN &&
-    candidate.score >= 125
+    candidate.score >= 115
   );
 
   if (!candidates.length) {
     return {
       stock: STOCK.UNKNOWN,
       count: 0,
-      total: 0,
       evidence: "",
     };
   }
@@ -1312,33 +1234,25 @@ function structuredConsensus(structured) {
     );
 
   const [stock, count] = ordered[0];
-  const topScore = candidates
-    .filter(candidate => candidate.stock === stock)
-    .reduce(
-      (maximum, candidate) => Math.max(maximum, candidate.score),
-      0
-    );
-  const ratio = count / candidates.length;
 
-  const accepted =
-    (count >= 2 && ratio >= 0.67) ||
-    (stock === STOCK.IN_STOCK && topScore >= 165) ||
-    (stock === STOCK.OOS && topScore >= 180);
-
-  if (accepted) {
+  if (
+    count >= 2 ||
+    (
+      count === 1 &&
+      candidates[0]?.score >= 150
+    )
+  ) {
     return {
       stock,
       count,
-      total: candidates.length,
       evidence:
-        `${count}/${candidates.length} high-confidence exact-item candidate(s) support ${stock}`,
+        `${count} exact-item structured candidate(s) support ${stock}`,
     };
   }
 
   return {
     stock: STOCK.UNKNOWN,
     count,
-    total: candidates.length,
     evidence: "",
   };
 }
@@ -1346,7 +1260,12 @@ function structuredConsensus(structured) {
 function finalDecision(structured, dom) {
   const domResult = domStock(dom);
   const consensus = structuredConsensus(structured);
-  const structuredStock = consensus.stock;
+  const structuredBestStock =
+    structured?.best?.stock || STOCK.UNKNOWN;
+  const structuredStock =
+    consensus.stock !== STOCK.UNKNOWN
+      ? consensus.stock
+      : structuredBestStock;
 
   if (
     domResult.stock === STOCK.LOW_STOCK ||
@@ -1357,6 +1276,20 @@ function finalDecision(structured, dom) {
       stock: domResult.stock,
       reason:
         `The exact linked item's selected offer reports: ` +
+        `${domResult.evidence}.`,
+      domResult,
+      consensus,
+    };
+  }
+
+  if (
+    domResult.stock === STOCK.OOS &&
+    domResult.strength === "strong"
+  ) {
+    return {
+      stock: STOCK.OOS,
+      reason:
+        `The exact linked item's selected offer reports OOS: ` +
         `${domResult.evidence}.`,
       domResult,
       consensus,
@@ -1378,64 +1311,29 @@ function finalDecision(structured, dom) {
   }
 
   if (
-    domResult.stock === STOCK.OOS &&
-    domResult.strength === "strong"
-  ) {
-    return {
-      stock: STOCK.OOS,
-      reason:
-        `The exact linked item's selected offer explicitly reports OOS: ` +
-        `${domResult.evidence}.`,
-      domResult,
-      consensus,
-    };
-  }
-
-  if (
-    domResult.stock === STOCK.IN_STOCK &&
-    domResult.strength === "medium"
-  ) {
-    return {
-      stock: STOCK.IN_STOCK,
-      reason:
-        `At least one valid fulfillment method is available for the exact item: ` +
-        `${domResult.evidence}.`,
-      domResult,
-      consensus,
-    };
-  }
-
-  if (
-    domResult.stock === STOCK.OOS &&
-    domResult.strength === "medium"
-  ) {
-    if (structuredStock === STOCK.OOS) {
-      return {
-        stock: STOCK.OOS,
-        reason:
-          "The selected purchase area and high-confidence exact-item data agree that the item is OOS.",
-        domResult,
-        consensus,
-      };
-    }
-
-    return {
-      stock: STOCK.UNKNOWN,
-      reason:
-        "Walmart shows unavailable fulfillment or OOS metadata, but no explicit selected-offer OOS proof was found.",
-      domResult,
-      consensus,
-    };
-  }
-
-  if (
-    domResult.stock === STOCK.UNKNOWN &&
-    structuredStock !== STOCK.UNKNOWN
+    structuredStock !== STOCK.UNKNOWN &&
+    domResult.stock === STOCK.UNKNOWN
   ) {
     return {
       stock: structuredStock,
       reason:
-        `High-confidence exact-item Walmart data supplied the stock result: ${consensus.evidence}.`,
+        consensus.stock !== STOCK.UNKNOWN
+          ? `Exact-item Walmart data agrees across ${consensus.count} candidate(s).`
+          : "A high-confidence exact-item Walmart offer supplied the stock result.",
+      domResult,
+      consensus,
+    };
+  }
+
+  if (
+    structuredStock === STOCK.UNKNOWN &&
+    domResult.stock !== STOCK.UNKNOWN
+  ) {
+    return {
+      stock: domResult.stock,
+      reason:
+        "The exact linked item's purchase and fulfillment area supplied " +
+        `the stock result: ${domResult.evidence}.`,
       domResult,
       consensus,
     };
@@ -1455,14 +1353,15 @@ function finalDecision(structured, dom) {
   }
 
   if (
-    structuredStock !== STOCK.UNKNOWN &&
     domResult.stock !== STOCK.UNKNOWN &&
-    structuredStock !== domResult.stock
+    domResult.strength === "medium" &&
+    structuredStock !== STOCK.UNKNOWN &&
+    domResult.stock !== structuredStock
   ) {
     return {
       stock: STOCK.UNKNOWN,
       reason:
-        "Walmart's selected purchase area and high-confidence exact-item data disagree " +
+        "Walmart's selected purchase area and exact-item offer data disagree " +
         `(${domResult.stock} versus ${structuredStock}).`,
       domResult,
       consensus,
@@ -1472,7 +1371,8 @@ function finalDecision(structured, dom) {
   return {
     stock: STOCK.UNKNOWN,
     reason:
-      "The exact Walmart item did not provide one reliable stock state without guessing.",
+      "The exact Walmart item did not provide one reliable stock " +
+      `state (${structuredStock} versus ${domResult.stock}).`,
     domResult,
     consensus,
   };
@@ -2424,18 +2324,6 @@ function selfTest() {
       STOCK.OOS,
     ],
     [
-      stockFromText("Delivery Not available"),
-      STOCK.UNKNOWN,
-    ],
-    [
-      fulfillmentStockFromText("Delivery Not available"),
-      STOCK.OOS,
-    ],
-    [
-      fulfillmentStockFromText("Shipping available, arrives tomorrow"),
-      STOCK.IN_STOCK,
-    ],
-    [
       normalizePrice("$1,299.99"),
       "1299.99",
     ],
@@ -2449,88 +2337,6 @@ function selfTest() {
     }
   }
 
-  const enabledCartDecision = finalDecision(
-    { candidates: [] },
-    {
-      enabledAdd: true,
-      buyNowEnabled: false,
-      cartControlLabel: "Add to cart",
-      exactStockTexts: [],
-      fulfillment: {
-        shipping: "Shipping available, arrives tomorrow",
-        delivery: "Delivery Not available",
-      },
-      availabilityMeta: "https://schema.org/OutOfStock",
-      offerControls: [],
-    }
-  );
-
-  if (enabledCartDecision.stock !== STOCK.IN_STOCK) {
-    throw new Error(
-      "Self-test failed: enabled Add to cart must override unavailable delivery."
-    );
-  }
-
-  const unavailableDeliveryOnly = finalDecision(
-    { candidates: [] },
-    {
-      enabledAdd: false,
-      buyNowEnabled: false,
-      disabledAdd: true,
-      exactStockTexts: [],
-      fulfillment: {
-        delivery: "Delivery Not available",
-      },
-      availabilityMeta: "",
-      offerControls: [],
-    }
-  );
-
-  if (unavailableDeliveryOnly.stock !== STOCK.UNKNOWN) {
-    throw new Error(
-      "Self-test failed: one unavailable fulfillment method must not become product OOS."
-    );
-  }
-
-  const shippingAvailableDecision = finalDecision(
-    { candidates: [] },
-    {
-      enabledAdd: false,
-      buyNowEnabled: false,
-      exactStockTexts: ["Out of stock"],
-      fulfillment: {
-        shipping: "Shipping available, arrives tomorrow",
-        delivery: "Delivery Not available",
-      },
-      availabilityMeta: "",
-      offerControls: [],
-    }
-  );
-
-  if (shippingAvailableDecision.stock !== STOCK.IN_STOCK) {
-    throw new Error(
-      "Self-test failed: available shipping must override an unavailable secondary method."
-    );
-  }
-
-  const explicitOosDecision = finalDecision(
-    { candidates: [] },
-    {
-      enabledAdd: false,
-      buyNowEnabled: false,
-      exactStockTexts: ["Out of stock"],
-      fulfillment: {},
-      availabilityMeta: "",
-      offerControls: [],
-    }
-  );
-
-  if (explicitOosDecision.stock !== STOCK.OOS) {
-    throw new Error(
-      "Self-test failed: explicit selected-offer OOS must remain OOS."
-    );
-  }
-
   if (
     !scraperTabStatePath("C:/test")
       .replace(/\\/g, "/")
@@ -2542,7 +2348,7 @@ function selfTest() {
   }
 
   process.stdout.write(
-    "Walmart v8 conservative availability runtime self-test passed.\n"
+    "Walmart variant and marketplace offer runtime self-test passed.\n"
   );
 }
 

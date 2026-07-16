@@ -54,6 +54,7 @@ class EngineResultGuard:
 
         if structured is not None:
             structured.row_number = int(row_num or 0)
+
             return self._evaluate_structured(
                 structured=structured,
                 supplier=supplier,
@@ -63,7 +64,7 @@ class EngineResultGuard:
                 is_verify=is_verify,
             )
 
-        # Other suppliers keep their existing legacy behavior.  Walmart is
+        # Other suppliers keep their existing legacy behavior. Walmart is
         # intentionally strict: a Success result without structured
         # verification metadata is not allowed to update the sheet.
         if supplier == "WAL" and normalized_status == "success":
@@ -71,6 +72,7 @@ class EngineResultGuard:
                 f"[WAL][Row {row_num}][UNKNOWN] No sheet update: "
                 "Walmart result is missing structured verification metadata."
             )
+
             self._emit(
                 supplier=supplier,
                 row_num=row_num,
@@ -80,6 +82,7 @@ class EngineResultGuard:
                 reason=message,
                 level="warning",
             )
+
             if is_verify:
                 return EngineDecision(
                     accept=True,
@@ -89,6 +92,7 @@ class EngineResultGuard:
                     message=message,
                     tag="warning",
                 )
+
             return EngineDecision(
                 accept=False,
                 price="",
@@ -100,9 +104,11 @@ class EngineResultGuard:
 
         if normalized_status in self.REVIEW_STATUS_NAMES:
             message = (
-                f"[{supplier}][Row {row_num}][{normalized_status.upper()}] "
+                f"[{supplier}][Row {row_num}]"
+                f"[{normalized_status.upper()}] "
                 "No sheet update: scraper requested manual review."
             )
+
             self._emit(
                 supplier=supplier,
                 row_num=row_num,
@@ -112,6 +118,7 @@ class EngineResultGuard:
                 reason=message,
                 level="warning",
             )
+
             if is_verify:
                 return EngineDecision(
                     accept=True,
@@ -121,6 +128,7 @@ class EngineResultGuard:
                     message=message,
                     tag="warning",
                 )
+
             return EngineDecision(
                 accept=False,
                 price="",
@@ -149,12 +157,19 @@ class EngineResultGuard:
         is_verify: bool,
     ) -> EngineDecision:
         verification = structured.verification
+
+        stock_only_mode = bool(
+            structured.metadata.get("walmart_stock_only_mode")
+            or structured.metadata.get("stock_only_mode")
+        )
+
         event_extra = {
             "title": title,
             "is_verify": bool(is_verify),
             "item_id": structured.item_id,
             "seller": structured.seller,
             "policy_reason": structured.policy_reason,
+            "stock_only_mode": stock_only_mode,
         }
 
         if not structured.is_safe_for_sheet:
@@ -163,10 +178,12 @@ class EngineResultGuard:
                 or structured.policy_reason
                 or f"Verification is {verification.value}."
             )
+
             message = (
                 f"[{supplier}][Row {row_num}][{verification.value}] "
                 f"No sheet update: {reason}"
             )
+
             self._emit(
                 supplier=supplier,
                 row_num=row_num,
@@ -180,7 +197,8 @@ class EngineResultGuard:
                 reason=reason,
                 level=(
                     "error"
-                    if verification in {
+                    if verification
+                    in {
                         VerificationStatus.ERROR,
                         VerificationStatus.BLOCKED,
                     }
@@ -188,7 +206,9 @@ class EngineResultGuard:
                 ),
                 extra=event_extra,
             )
+
             phase2_error = bool(is_verify)
+
             return EngineDecision(
                 accept=phase2_error,
                 price="",
@@ -201,7 +221,8 @@ class EngineResultGuard:
                     "Error"
                     if (
                         phase2_error
-                        or verification in {
+                        or verification
+                        in {
                             VerificationStatus.ERROR,
                             VerificationStatus.BLOCKED,
                         }
@@ -211,7 +232,8 @@ class EngineResultGuard:
                 message=message,
                 tag=(
                     "error"
-                    if verification in {
+                    if verification
+                    in {
                         VerificationStatus.ERROR,
                         VerificationStatus.BLOCKED,
                     }
@@ -223,18 +245,33 @@ class EngineResultGuard:
                 ),
             )
 
-        final_price = (
-            ScrapeResult.format_price(structured.price)
-            if structured.sheet_stock == "In Stock"
-            else ""
+        final_price = ""
+
+        if (
+            structured.sheet_stock == "In Stock"
+            and not stock_only_mode
+        ):
+            final_price = ScrapeResult.format_price(
+                structured.price
+            )
+
+        display_price = (
+            "[manual review only]"
+            if (
+                stock_only_mode
+                and structured.sheet_stock == "In Stock"
+            )
+            else final_price or "[blank]"
         )
+
         message = (
             f"[{supplier}][Row {row_num}][VERIFIED] "
             f"Observed={structured.observed_stock.value} | "
             f"Sheet={structured.sheet_stock} | "
-            f"Price={final_price or '[blank]'} | "
+            f"Price={display_price} | "
             f"Reason={structured.policy_reason}"
         )
+
         self._emit(
             supplier=supplier,
             row_num=row_num,
@@ -249,6 +286,7 @@ class EngineResultGuard:
             level="info",
             extra=event_extra,
         )
+
         return EngineDecision(
             accept=True,
             price=final_price,
@@ -287,7 +325,10 @@ class EngineResultGuard:
                 quantity=quantity,
                 reason=reason,
                 level=level,
-                extra={"supplier": supplier, **(extra or {})},
+                extra={
+                    "supplier": supplier,
+                    **(extra or {}),
+                },
             )
         except OSError:
             # Logging must never disable the safety gate.

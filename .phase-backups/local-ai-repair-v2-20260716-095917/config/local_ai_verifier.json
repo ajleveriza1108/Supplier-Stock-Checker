@@ -1,8 +1,8 @@
 {
   "version": 1,
   "enabled": false,
-  "model_path": "D:\\Python\\Qwen3-4B-Q4_K_M.gguf",
-  "server_path": "D:\\Python\\llama-b10034-bin-win-cpu-x64\\llama-server.exe",
+  "model_path": "",
+  "server_path": "",
   "host": "127.0.0.1",
   "port": 8099,
   "context_size": 4096,

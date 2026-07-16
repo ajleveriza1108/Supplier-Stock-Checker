@@ -1,0 +1,12 @@
+{
+  "headless": true,
+  "browser_channel": "chromium",
+  "navigation_timeout_ms": 45000,
+  "settle_timeout_ms": 12000,
+  "process_timeout_seconds": 90,
+  "fixed_zip_code": "",
+  "profile_directory": "browser_profiles/walmart_playwright",
+  "save_debug_evidence": true,
+  "screenshots_on_error": true,
+  "block_images": false
+}
