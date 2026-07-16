@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "enabled": false,
+  "model_path": ".",
+  "server_path": "D:\\Python\\llama-b10034-bin-win-cpu-x64\\llama-server.exe",
+  "host": "127.0.0.1",
+  "port": 8099,
+  "context_size": 4096,
+  "threads": 0,
+  "gpu_layers": 99,
+  "timeout_seconds": 120,
+  "confidence_threshold": 0.72,
+  "auto_start_server": true,
+  "verify_price_changes": true
+}

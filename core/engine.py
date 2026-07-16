@@ -483,7 +483,7 @@ class ScrapingEngine:
                                 "OFF",
                                 "Regular (Regex)",
                             )
-                            and self.ai_memory.is_known_problem(url)
+                            and False  # Local AI verifies changes; it never replaces scrapers.
                         ):
                             self.queue.put(("LOG", f"[{supplier}] Memory triggered: Bypassing standard scraper for known problem URL.", "warning", url))
                             ai = OllamaAI(model_string=self.ai_mode)
@@ -632,7 +632,7 @@ class ScrapingEngine:
                             "OFF",
                             "Regular (Regex)",
                         )
-                        and self.ai_memory.is_known_problem(url)
+                        and False  # Local AI verifies changes; it never replaces scrapers.
                     ):
                         self.queue.put(("LOG", f"[{supplier}] Memory triggered: Bypassing standard scraper for known problem URL.", "warning", url))
                         ai = OllamaAI(model_string=self.ai_mode)
@@ -960,6 +960,9 @@ class ScrapingEngine:
                 stock,
                 self.ai_mode,
                 supplier=supplier,
+                title=title,
+                variants=variants,
+                row=row,
             )
             reason = getattr(self.validator, "last_reason", "")
 
