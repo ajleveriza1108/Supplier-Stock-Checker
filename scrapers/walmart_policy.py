@@ -20,7 +20,7 @@ from core.result_policy import apply_stock_policy
 from core.scrape_result import Evidence, ScrapeResult, StockState, VerificationStatus
 
 
-WALMART_POLICY_VERSION = "2026.07.16.3"
+WALMART_POLICY_VERSION = "2026.07.16.5"
 
 
 LOW_INVENTORY_STATES = {
@@ -491,18 +491,46 @@ class WalmartPolicy:
         unavailable_methods = fulfillment_states.count("UNAVAILABLE")
 
         if enabled_cta:
-            if selected_option_oos or product_oos:
+            all_fulfillment_unavailable = (
+                len(fulfillment_states) >= 2
+                and unavailable_methods == len(fulfillment_states)
+                and available_methods == 0
+            )
+
+            if all_fulfillment_unavailable:
+                if selected_option_oos or product_oos:
+                    return (
+                        StockState.OOS,
+                        None,
+                        (
+                            "The selected Walmart item reports explicit "
+                            "unavailability and every detected fulfillment "
+                            "method is unavailable."
+                        ),
+                        False,
+                        (
+                            "selected_option"
+                            if selected_option_oos
+                            else "product"
+                        ),
+                    )
+
                 return (
                     StockState.UNKNOWN,
                     None,
                     (
-                        "The primary Add to cart control is enabled, but the "
-                        "same primary purchase block also reports product OOS."
+                        "An enabled Add to cart control conflicts with every "
+                        "detected fulfillment method being unavailable."
                     ),
                     True,
-                    "product",
+                    "cta_fulfillment_conflict",
                 )
 
+            # Walmart may render unavailable alternative colors, conditions,
+            # or other seller offers in the same broad purchase region.
+            # When the exact selected item has a valid primary CTA and at
+            # least one non-unavailable fulfillment result, those alternate
+            # OOS labels must not override the selected item.
             stock, quantity = parse_inventory_detail(
                 inventory_text,
                 available=True,

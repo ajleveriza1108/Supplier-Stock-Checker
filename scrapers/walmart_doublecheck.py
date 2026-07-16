@@ -22,7 +22,7 @@ from core.scraper_diagnostics import result_to_legacy_tuple
 from scrapers.walmart import WalmartScraper
 
 
-WALMART_FINAL_GUARD_VERSION = "2026.07.16.3"
+WALMART_FINAL_GUARD_VERSION = "2026.07.16.5"
 
 
 class WalmartDoubleCheckScraper(WalmartScraper):

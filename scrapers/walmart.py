@@ -31,7 +31,7 @@ from scrapers.walmart_policy import (
 )
 
 
-WALMART_VISUAL_FIX_VERSION = "2026.07.16.3"
+WALMART_VISUAL_FIX_VERSION = "2026.07.16.5"
 
 
 class WalmartScraper(BaseScraper):
@@ -892,33 +892,72 @@ class WalmartScraper(BaseScraper):
 
             for (const node of document.querySelectorAll("div,span,p,h3,h4")) {
                 if (!inPurchaseWindow(node)) continue;
+
                 const label = (directText(node) || ownText(node)).toLowerCase();
                 if (!fulfillmentLabels.includes(label)) continue;
 
+                const candidates = [];
                 let box = node.parentElement;
-                let selected = null;
+
                 for (
                     let depth = 0;
-                    box && depth < 5;
+                    box && depth < 6;
                     depth++, box = box.parentElement
                 ) {
                     if (!inPurchaseWindow(box)) continue;
+
                     const value = ownText(box);
-                    if (value.length >= label.length && value.length <= 550) {
-                        selected = box;
-                        if (
-                            /out of stock|not available|unavailable|arrives|order within|today|tomorrow|check nearby|get it nearby/i
-                                .test(value)
-                        ) {
-                            break;
-                        }
+                    if (
+                        value.length < label.length ||
+                        value.length > 550
+                    ) {
+                        continue;
                     }
+
+                    const lower = value.toLowerCase();
+                    const otherLabelCount = fulfillmentLabels.filter(
+                        other =>
+                            other !== label &&
+                            new RegExp(`\\b${other}\\b`, "i").test(lower)
+                    ).length;
+
+                    const hasLowInventory =
+                        /low stock|limited stock|only\s+\d+\s+(?:left|remaining|in stock)/i
+                            .test(value);
+
+                    const hasAvailability =
+                        /out of stock|not available|unavailable|sold out|arrives|delivery date|order within|free shipping|today|tomorrow|get it nearby|ready in|check nearby/i
+                            .test(value);
+
+                    candidates.push({
+                        box,
+                        value,
+                        depth,
+                        otherLabelCount,
+                        hasLowInventory,
+                        hasAvailability
+                    });
                 }
 
-                if (!selected) continue;
-                const value = ownText(selected);
+                if (!candidates.length) continue;
+
+                // Isolation is more important than finding the strongest
+                // negative phrase. V4 scored OOS text too highly and selected
+                // a shared parent containing Shipping, Pickup, and Delivery,
+                // which made all three methods appear unavailable.
+                candidates.sort((first, second) =>
+                    (first.otherLabelCount - second.otherLabelCount) ||
+                    (Number(second.hasLowInventory) - Number(first.hasLowInventory)) ||
+                    (Number(second.hasAvailability) - Number(first.hasAvailability)) ||
+                    (first.depth - second.depth) ||
+                    (first.value.length - second.value.length)
+                );
+
+                const selected = candidates[0].box;
+                const value = candidates[0].value;
                 const top = pageY(selected);
                 const bottom = top + selected.getBoundingClientRect().height;
+
                 fulfillment[label] = {
                     state: fulfillmentState(value),
                     text: value.slice(0, 400),
@@ -927,15 +966,63 @@ class WalmartScraper(BaseScraper):
                 };
                 fulfillmentRanges.push({label, top, bottom});
 
-                // Walmart often places "Low stock" or "Only N remaining"
-                // inside the selected fulfillment card instead of beside the
-                // primary Add to cart control. Preserve that wording as
-                // selected-item inventory evidence so the business rule can
-                // treat it as OOS.
                 if (
                     /low stock|limited stock|only\s+\d+\s+(?:left|remaining|in stock)/i
                         .test(value)
                 ) {
+                    fulfillmentInventoryTexts.push(value);
+                }
+            }
+
+            // Walmart sometimes renders Low Stock as a nearby status node
+            // rather than inside the smallest fulfillment-card wrapper.
+            // Scan only below the primary purchase anchor, close to the
+            // selected item's CTA, and outside variant/recommendation areas.
+            const primaryCtaY = enabledAdd ? pageY(enabledAdd) : anchorY;
+
+            for (const node of document.querySelectorAll("div,span,p")) {
+                if (!inPurchaseWindow(node)) continue;
+                if (belongsToDifferentItem(node)) continue;
+
+                const fullText = ownText(node);
+                const atomicText =
+                    directText(node) ||
+                    (node.children.length === 0 ? fullText : "");
+
+                const value = atomicText || fullText;
+                if (!value || value.length > 180) continue;
+
+                if (
+                    !/low stock|limited stock|only\s+\d+\s+(?:left|remaining|in stock)/i
+                        .test(value)
+                ) {
+                    continue;
+                }
+
+                const y = pageY(node);
+                if (
+                    y < anchorY - 5 ||
+                    y > primaryCtaY + 440
+                ) {
+                    continue;
+                }
+
+                const inAlternativeArea = hasTokenAncestor(
+                    node,
+                    [
+                        "variant",
+                        "swatch",
+                        "color",
+                        "size",
+                        "condition",
+                        "carousel",
+                        "recommendation",
+                        "sponsored"
+                    ],
+                    8
+                );
+
+                if (!inAlternativeArea) {
                     fulfillmentInventoryTexts.push(value);
                 }
             }
