@@ -11,7 +11,11 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scrapers.walmart import WalmartScraper, _ResolvedSnapshot
+from scrapers.walmart import (
+    WalmartScraper,
+    _EXACT_SELECTED_OFFER_SCRIPT,
+    _ResolvedSnapshot,
+)
 
 
 class WalmartExactSelectedOfferTests(unittest.TestCase):
@@ -66,6 +70,33 @@ class WalmartExactSelectedOfferTests(unittest.TestCase):
         self.assertEqual(result.status, "Error")
         self.assertEqual(result.stock, "Unable to Verify")
 
+    def test_unbound_rendered_price_is_not_trusted(self):
+        result = self.resolve(
+            enabledPurchase=True,
+            purchaseControlExact=True,
+            priceText="$49.88",
+            priceExact=False,
+        )
+        self.assertEqual(result.status, "Error")
+        self.assertEqual(result.stock, "Unable to Verify")
+        self.assertIn("same exact offer", result.reason.lower())
+
+    def test_conflicting_rendered_prices_are_held(self):
+        result = self.resolve(
+            enabledPurchase=True,
+            purchaseControlExact=True,
+            priceText="$49.88",
+            priceExact=True,
+            priceConflict=True,
+            priceCandidates=[
+                {"text": "$49.88", "highConfidence": True},
+                {"text": "$59.88", "highConfidence": True},
+            ],
+        )
+        self.assertEqual(result.status, "Error")
+        self.assertEqual(result.stock, "Unable to Verify")
+        self.assertIn("multiple current prices", result.reason.lower())
+
     def test_selected_option_oos_without_purchase_is_oos(self):
         result = self.resolve(
             selectedOptionOos=True,
@@ -93,6 +124,18 @@ class WalmartExactSelectedOfferTests(unittest.TestCase):
         )
         self.assertEqual(result.stock, "Limited Stock")
 
+    def test_sibling_low_stock_text_is_ignored(self):
+        result = self.resolve(
+            enabledPurchase=True,
+            purchaseControlExact=True,
+            priceText="$79.00",
+            priceExact=True,
+            lowStockTexts=["Low stock"],
+            lowStockExact=False,
+        )
+        self.assertEqual(result.status, "Success")
+        self.assertEqual(result.stock, "In Stock")
+
     def test_quantity_remaining_is_preserved(self):
         result = self.resolve(
             enabledPurchase=True,
@@ -109,6 +152,24 @@ class WalmartExactSelectedOfferTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "Success")
         self.assertEqual(result.stock, "OOS")
+
+    def test_unbound_product_oos_is_held(self):
+        result = self.resolve(
+            productOos=True,
+            productOosExact=False,
+            productOosTexts=["Out of stock"],
+        )
+        self.assertEqual(result.status, "Error")
+        self.assertEqual(result.stock, "Unable to Verify")
+
+    def test_unbound_selected_option_oos_is_held(self):
+        result = self.resolve(
+            selectedOptionOos=True,
+            selectedOptionExact=False,
+            productOos=False,
+        )
+        self.assertEqual(result.status, "Error")
+        self.assertEqual(result.stock, "Unable to Verify")
 
     def test_json_ld_alone_is_held_instead_of_updating(self):
         result = self.resolve(
@@ -162,6 +223,28 @@ class WalmartExactSelectedOfferTests(unittest.TestCase):
         )
         self.assertEqual(result.status, "Error")
         self.assertEqual(result.stock, "Unable to Verify")
+
+    def test_script_excludes_non_rendered_meta_prices(self):
+        self.assertNotIn(
+            'meta[itemprop="price"]',
+            _EXACT_SELECTED_OFFER_SCRIPT,
+        )
+
+    def test_script_requires_exact_control_association(self):
+        self.assertIn(
+            "chosenPurchaseControl.associationStrength >= 2",
+            _EXACT_SELECTED_OFFER_SCRIPT,
+        )
+        self.assertIn(
+            "exact_product_title",
+            _EXACT_SELECTED_OFFER_SCRIPT,
+        )
+
+    def test_script_does_not_propagate_identity_to_nested_variants(self):
+        self.assertNotIn(
+            "attachedExactProduct",
+            _EXACT_SELECTED_OFFER_SCRIPT,
+        )
 
     def test_item_id_parser(self):
         self.assertEqual(

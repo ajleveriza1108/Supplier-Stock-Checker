@@ -214,7 +214,10 @@ class BraveDebugManager:
                 ]
             )
         else:
-            command.append("--start-maximized")
+            # The debug browser is an automation surface, not part of the
+            # application's foreground UI.  Starting it minimized prevents
+            # Brave from stealing focus before Selenium can attach.
+            command.append("--start-minimized")
 
         creation_flags = getattr(
             subprocess,
@@ -701,6 +704,9 @@ class BraveDebugManager:
                 self.driver.set_page_load_timeout(
                     45
                 )
+                self.keep_browser_minimized(
+                    self.driver
+                )
 
                 print(
                     "✅ Selenium successfully "
@@ -720,6 +726,95 @@ class BraveDebugManager:
                     f"Original error: "
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
+
+    @staticmethod
+    def _target_id_from_handle(
+        handle: str,
+    ) -> str:
+        value = str(handle or "")
+        prefix = "CDwindow-"
+        if value.startswith(prefix):
+            return value[len(prefix):]
+        return value
+
+    @classmethod
+    def _handle_matches_target(
+        cls,
+        handle: str,
+        target_id: str,
+    ) -> bool:
+        return (
+            cls._target_id_from_handle(handle)
+            == str(target_id or "")
+        )
+
+    def keep_browser_minimized(
+        self,
+        driver=None,
+    ) -> bool:
+        """
+        Reapply the minimized state without activating the Brave window.
+
+        ``Target.createTarget(background=True)`` normally preserves the
+        window state.  This CDP guard handles Chromium builds that restore a
+        minimized window while ChromeDriver attaches or changes targets.
+        Failures are intentionally non-fatal because scraping can continue
+        even when a particular Chromium build does not expose window bounds.
+        """
+        if self.headless:
+            return True
+
+        current_driver = driver or self.driver
+        if current_driver is None:
+            return False
+
+        window_info = None
+        try:
+            window_info = current_driver.execute_cdp_cmd(
+                "Browser.getWindowForTarget",
+                {},
+            )
+        except Exception:
+            try:
+                target_id = self._target_id_from_handle(
+                    current_driver.current_window_handle
+                )
+                window_info = current_driver.execute_cdp_cmd(
+                    "Browser.getWindowForTarget",
+                    {"targetId": target_id},
+                )
+            except Exception:
+                return False
+
+        window_id = (
+            window_info.get("windowId")
+            if isinstance(window_info, dict)
+            else None
+        )
+        if window_id is None:
+            return False
+
+        bounds = (
+            window_info.get("bounds") or {}
+            if isinstance(window_info, dict)
+            else {}
+        )
+        if bounds.get("windowState") == "minimized":
+            return True
+
+        try:
+            current_driver.execute_cdp_cmd(
+                "Browser.setWindowBounds",
+                {
+                    "windowId": window_id,
+                    "bounds": {
+                        "windowState": "minimized",
+                    },
+                },
+            )
+            return True
+        except Exception:
+            return False
 
     def wait_for_js_interactive(
         self,
@@ -752,10 +847,26 @@ class BraveDebugManager:
         with self.operation_lock:
             driver = self.get_driver()
             before = set(driver.window_handles)
+            target_id = ""
 
-            driver.execute_script(
-                "window.open('about:blank', '_blank');"
-            )
+            try:
+                created = driver.execute_cdp_cmd(
+                    "Target.createTarget",
+                    {
+                        "url": "about:blank",
+                        "background": True,
+                    },
+                )
+                if isinstance(created, dict):
+                    target_id = str(
+                        created.get("targetId") or ""
+                    )
+            except Exception:
+                # Compatibility fallback for Chromium builds that do not
+                # expose the background Target.createTarget option.
+                driver.execute_script(
+                    "window.open('about:blank', '_blank');"
+                )
 
             WebDriverWait(
                 driver,
@@ -778,7 +889,20 @@ class BraveDebugManager:
                     "Brave did not create a new tab."
                 )
 
-            return new_handles[-1]
+            selected_handle = next(
+                (
+                    handle
+                    for handle in new_handles
+                    if target_id
+                    and self._handle_matches_target(
+                        handle,
+                        target_id,
+                    )
+                ),
+                new_handles[-1],
+            )
+            self.keep_browser_minimized(driver)
+            return selected_handle
 
     def switch_to_tab(
         self,
@@ -794,6 +918,7 @@ class BraveDebugManager:
                 )
 
             driver.switch_to.window(handle)
+            self.keep_browser_minimized(driver)
 
     def close_tab(
         self,
@@ -808,6 +933,7 @@ class BraveDebugManager:
 
             if len(handles) == 1:
                 driver.get("about:blank")
+                self.keep_browser_minimized(driver)
                 return
 
             original_handle = (
@@ -835,6 +961,7 @@ class BraveDebugManager:
                 driver.switch_to.window(
                     remaining_handles[0]
                 )
+            self.keep_browser_minimized(driver)
 
     def restart_browser(self) -> None:
         with self.lock:

@@ -32,7 +32,7 @@ from selenium.common.exceptions import (
 from selenium.webdriver.support.ui import WebDriverWait
 
 
-WALMART_SCRAPER_VERSION = "2026.07.20.exact-selected-offer-v9.1.1"
+WALMART_SCRAPER_VERSION = "2026.07.25.exact-offer-binding-v10.0.0"
 
 _STOCK_IN = "In Stock"
 _STOCK_OOS = "OOS"
@@ -157,8 +157,9 @@ class WalmartScraper:
         created_handle: Optional[str] = None
 
         try:
-            driver.switch_to.new_window("tab")
-            created_handle = driver.current_window_handle
+            created_handle = self._open_background_tab(driver)
+            self._switch_to_tab(driver, created_handle)
+            self._keep_browser_minimized(driver)
 
             try:
                 driver.execute_cdp_cmd("Network.clearBrowserCache", {})
@@ -166,7 +167,9 @@ class WalmartScraper:
                 pass
 
             driver.get("about:blank")
+            self._keep_browser_minimized(driver)
             driver.get(url)
+            self._keep_browser_minimized(driver)
 
             wait_seconds = self._navigation_timeout_seconds()
             WebDriverWait(driver, wait_seconds, poll_frequency=0.35).until(
@@ -175,6 +178,7 @@ class WalmartScraper:
                     requested_item_id,
                 )
             )
+            self._keep_browser_minimized(driver)
 
             resolved: Optional[_ResolvedSnapshot] = None
             raw_snapshots: list[dict[str, Any]] = []
@@ -184,8 +188,10 @@ class WalmartScraper:
                 if navigation_attempt:
                     try:
                         driver.get("about:blank")
+                        self._keep_browser_minimized(driver)
                         time.sleep(0.4)
                         driver.get(url)
+                        self._keep_browser_minimized(driver)
                         WebDriverWait(
                             driver,
                             wait_seconds,
@@ -196,6 +202,7 @@ class WalmartScraper:
                                 requested_item_id,
                             )
                         )
+                        self._keep_browser_minimized(driver)
                     except Exception as exc:
                         attempt_reasons.append(
                             "Fresh-page retry failed: "
@@ -313,19 +320,84 @@ class WalmartScraper:
             if created_handle:
                 try:
                     if created_handle in driver.window_handles:
-                        driver.switch_to.window(created_handle)
-                        driver.close()
+                        close_tab = getattr(
+                            self.browser_manager,
+                            "close_tab",
+                            None,
+                        )
+                        if callable(close_tab):
+                            close_tab(created_handle)
+                        else:
+                            driver.switch_to.window(created_handle)
+                            driver.close()
                 except Exception:
                     pass
 
             try:
                 handles = driver.window_handles
                 if original_handle and original_handle in handles:
-                    driver.switch_to.window(original_handle)
+                    self._switch_to_tab(
+                        driver,
+                        original_handle,
+                    )
                 elif handles:
-                    driver.switch_to.window(handles[0])
+                    self._switch_to_tab(
+                        driver,
+                        handles[0],
+                    )
+                self._keep_browser_minimized(driver)
             except Exception:
                 pass
+
+    def _open_background_tab(
+        self,
+        driver: Any,
+    ) -> str:
+        get_new_tab = getattr(
+            self.browser_manager,
+            "get_new_tab",
+            None,
+        )
+        if callable(get_new_tab):
+            return str(get_new_tab())
+
+        driver.switch_to.new_window("tab")
+        return str(driver.current_window_handle)
+
+    def _switch_to_tab(
+        self,
+        driver: Any,
+        handle: str,
+    ) -> None:
+        switch_to_tab = getattr(
+            self.browser_manager,
+            "switch_to_tab",
+            None,
+        )
+        if callable(switch_to_tab):
+            switch_to_tab(handle)
+            return
+
+        driver.switch_to.window(handle)
+
+    def _keep_browser_minimized(
+        self,
+        driver: Any,
+    ) -> None:
+        keep_minimized = getattr(
+            self.browser_manager,
+            "keep_browser_minimized",
+            None,
+        )
+        if not callable(keep_minimized):
+            return
+
+        try:
+            keep_minimized(driver)
+        except Exception:
+            # Window-state protection must never turn a stock check into an
+            # application error.
+            pass
 
     def _collect_consensus(
         self,
@@ -407,16 +479,31 @@ class WalmartScraper:
         final_url = str(raw.get("pageUrl") or "")
         page_item_id = str(raw.get("pageItemId") or cls._extract_item_id(final_url))
         price = cls._normalize_price(raw.get("priceText"))
+        price_exact = bool(raw.get("priceExact", True))
+        price_conflict = bool(raw.get("priceConflict"))
         purchase_control_exact = bool(raw.get("purchaseControlExact", True))
         enabled_purchase = (
             bool(raw.get("enabledPurchase"))
             and purchase_control_exact
         )
-        selected_option_oos = bool(raw.get("selectedOptionOos"))
-        product_oos = bool(raw.get("productOos"))
+        selected_option_exact = bool(
+            raw.get("selectedOptionExact", True)
+        )
+        selected_option_oos = (
+            bool(raw.get("selectedOptionOos"))
+            and selected_option_exact
+        )
+        product_oos_exact = bool(
+            raw.get("productOosExact", True)
+        )
+        product_oos = (
+            bool(raw.get("productOos"))
+            and product_oos_exact
+        )
         all_fulfillment_unavailable = bool(raw.get("allFulfillmentUnavailable"))
         identity_conflict = bool(raw.get("identityConflict"))
         low_text = cls._first_text(raw.get("lowStockTexts"))
+        low_stock_exact = bool(raw.get("lowStockExact", True))
         json_ld = raw.get("jsonLdExact") or {}
         json_ld_stock = cls._json_ld_stock(json_ld.get("availability"))
         json_ld_price = cls._normalize_price(json_ld.get("price"))
@@ -432,9 +519,15 @@ class WalmartScraper:
             "identity_ids": raw.get("identityIds") or [],
             "identity_conflict": identity_conflict,
             "price_text": raw.get("priceText") or "",
+            "price_exact": price_exact,
+            "price_conflict": price_conflict,
+            "price_candidates": raw.get("priceCandidates") or [],
             "low_stock_texts": raw.get("lowStockTexts") or [],
+            "low_stock_exact": low_stock_exact,
             "product_oos_texts": raw.get("productOosTexts") or [],
+            "product_oos_exact": product_oos_exact,
             "selected_option_oos": selected_option_oos,
+            "selected_option_exact": selected_option_exact,
             "fulfillment": raw.get("fulfillment") or {},
             "json_ld_exact": json_ld,
             "json_ld_conflict": json_ld_conflict,
@@ -481,13 +574,13 @@ class WalmartScraper:
             )
 
         quantity_match = _QUANTITY_RE.search(low_text)
-        if enabled_purchase and quantity_match:
+        if enabled_purchase and low_stock_exact and quantity_match:
             quantity = quantity_match.group(1) or quantity_match.group(2)
             stock = f"Only {int(quantity)} Remaining"
             return _ResolvedSnapshot(
                 status="Success",
                 stock=stock,
-                price=price or json_ld_price,
+                price=price,
                 title=title,
                 item_id=requested_item_id,
                 reason=(
@@ -497,11 +590,15 @@ class WalmartScraper:
                 evidence=base_evidence,
             )
 
-        if enabled_purchase and _LIMITED_STOCK_RE.search(low_text):
+        if (
+            enabled_purchase
+            and low_stock_exact
+            and _LIMITED_STOCK_RE.search(low_text)
+        ):
             return _ResolvedSnapshot(
                 status="Success",
                 stock=_STOCK_LIMITED,
-                price=price or json_ld_price,
+                price=price,
                 title=title,
                 item_id=requested_item_id,
                 reason=(
@@ -511,11 +608,15 @@ class WalmartScraper:
                 evidence=base_evidence,
             )
 
-        if enabled_purchase and _LOW_STOCK_RE.search(low_text):
+        if (
+            enabled_purchase
+            and low_stock_exact
+            and _LOW_STOCK_RE.search(low_text)
+        ):
             return _ResolvedSnapshot(
                 status="Success",
                 stock=_STOCK_LOW,
-                price=price or json_ld_price,
+                price=price,
                 title=title,
                 item_id=requested_item_id,
                 reason=(
@@ -542,6 +643,35 @@ class WalmartScraper:
         # create an In Stock result by itself because Walmart can leave stale
         # offers or sibling-variant state in structured data.
         if enabled_purchase:
+            if price_conflict:
+                return _ResolvedSnapshot(
+                    status="Error",
+                    stock=_STOCK_UNKNOWN,
+                    price="",
+                    title=title,
+                    item_id=requested_item_id,
+                    reason=(
+                        "Multiple current prices were found inside the exact "
+                        "selected offer. The row was held instead of choosing "
+                        "one price."
+                    ),
+                    evidence=base_evidence,
+                )
+
+            if price and not price_exact:
+                return _ResolvedSnapshot(
+                    status="Error",
+                    stock=_STOCK_UNKNOWN,
+                    price="",
+                    title=title,
+                    item_id=requested_item_id,
+                    reason=(
+                        "A rendered price was visible, but it could not be "
+                        "bound to the same exact offer as the purchase control."
+                    ),
+                    evidence=base_evidence,
+                )
+
             if not price:
                 return _ResolvedSnapshot(
                     status="Error",
@@ -1000,11 +1130,12 @@ const elementToken = element => normalize([
 ].join(' ')).toLowerCase();
 const recommendationPattern = /recommend|sponsor|carousel|similar|related|also.viewed|popular.picks|you.may.also.like|frequently.bought|customers.also/;
 const alternateConditionPattern = /\b(open box|used|refurbished|pre-owned|renewed)\b/i;
+const unselectedVariantPattern = /variant|option|swatch|choice|selector|tile/;
 
 const itemIdsNear = element => {
   const ids = new Set();
   let current = element;
-  for (let depth = 0; current && depth < 10; depth += 1, current = current.parentElement) {
+  for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
     for (const attr of ['data-item-id', 'data-us-item-id', 'data-product-id', 'data-tl-id']) {
       const value = normalize(current.getAttribute?.(attr));
       if (/^\d{5,}$/.test(value)) ids.add(value);
@@ -1012,12 +1143,14 @@ const itemIdsNear = element => {
     const href = normalize(current.getAttribute?.('href'));
     const match = href.match(/\/(\d{5,})(?:[/?#]|$)/);
     if (match) ids.add(match[1]);
-    for (const link of current.querySelectorAll?.('a[href*="/ip/"]') || []) {
-      const linked = normalize(link.getAttribute('href'));
-      const linkedMatch = linked.match(/\/(\d{5,})(?:[/?#]|$)/);
+    // Never scan every descendant link of a broad ancestor. Walmart places
+    // sibling variants and recommendations under shared containers.
+    for (const link of current.querySelectorAll?.(':scope > a[href*="/ip/"]') || []) {
+      const linkedMatch = normalize(link.getAttribute('href'))
+        .match(/\/(\d{5,})(?:[/?#]|$)/);
       if (linkedMatch) ids.add(linkedMatch[1]);
-      if (ids.size > 10) break;
     }
+    if (ids.size) break;
   }
   return [...ids];
 };
@@ -1032,13 +1165,64 @@ const hasExcludedAncestor = element => {
   return false;
 };
 
-const itemAssociation = element => {
-  const ids = itemIdsNear(element);
-  if (!ids.length) return { strength: 1, ids };
-  if (ids.includes(requestedItemId)) return { strength: 2, ids };
-  return { strength: 0, ids };
+const insideUnselectedVariant = element => {
+  let current = element;
+  for (let depth = 0; current && depth < 7; depth += 1, current = current.parentElement) {
+    if (!unselectedVariantPattern.test(elementToken(current))) continue;
+    const selected = current.getAttribute?.('aria-selected');
+    const checked = current.getAttribute?.('aria-checked');
+    const dataSelected = current.getAttribute?.('data-selected');
+    if (selected === 'false' || checked === 'false' || dataSelected === 'false') {
+      return true;
+    }
+  }
+  return false;
 };
-const belongsToRequestedItem = element => itemAssociation(element).strength > 0;
+
+const productName = value => lower(value)
+  .replace(/\badd to cart\b|\bbuy now\b|\bwith add-on services\b/g, ' ')
+  .replace(/[^a-z0-9]+/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const exactTitleAssociation = (element, providedLabel = '') => {
+  const controlName = productName(
+    providedLabel
+    || element?.getAttribute?.('aria-label')
+    || element?.getAttribute?.('title')
+    || element?.textContent
+  );
+  const pageName = productName(title);
+  if (!controlName || !pageName || Math.min(controlName.length, pageName.length) < 20) {
+    return false;
+  }
+  return controlName.includes(pageName) || pageName.includes(controlName);
+};
+
+const itemAssociation = (element, providedLabel = '') => {
+  const ids = itemIdsNear(element);
+  if (ids.length) {
+    if (ids.length === 1 && ids[0] === requestedItemId) {
+      return { strength: 3, ids, source: 'exact_local_item_id' };
+    }
+    return { strength: 0, ids, source: 'conflicting_local_item_id' };
+  }
+  if (exactTitleAssociation(element, providedLabel)) {
+    return { strength: 2, ids, source: 'exact_product_title' };
+  }
+  if (/^(add to cart|add to basket|buy now)$/i.test(normalize(providedLabel))) {
+    return { strength: 1, ids, source: 'generic_primary_control' };
+  }
+  return { strength: 0, ids, source: 'unbound' };
+};
+const belongsToRequestedItem = element => itemAssociation(
+  element,
+  normalize(
+    element?.getAttribute?.('aria-label')
+    || element?.getAttribute?.('title')
+    || element?.textContent
+  )
+).strength > 0;
 
 const insideAlternateCondition = element => {
   let current = element;
@@ -1094,20 +1278,25 @@ const controls = [...main.querySelectorAll('button, [role="button"], input[type=
       || element.value
       || element.textContent
     );
-    const token = elementToken(element);
+    const token = lower(
+      elementToken(element)
+      + ' '
+      + normalize(element.getAttribute('itemprop'))
+    );
     const enabled = !element.disabled && element.getAttribute('aria-disabled') !== 'true';
-    const association = itemAssociation(element);
+    const association = itemAssociation(element, label);
     const y = pageY(element);
     let score = 0;
     if (/^(add to cart|add to basket|buy now)$/i.test(label)) score += 100;
     if (/add[-_ ]?to[-_ ]?cart|addtocart|buy[-_ ]?now/.test(token)) score += 80;
-    if (association.strength === 2) score += 140;
+    if (association.strength >= 2) score += 140;
     if (association.strength === 1) score += 20;
     if (enabled) score += 20;
     score -= Math.min(120, Math.abs(y - (startY + 900)) / 20);
     return {
       element, label, token, enabled, y, score,
       associationStrength: association.strength,
+      associationSource: association.source,
       associatedItemIds: association.ids,
     };
   });
@@ -1123,45 +1312,111 @@ const disabledPurchaseControl = purchaseControls.find(item => !item.enabled) || 
 const chosenPurchaseControl = enabledPurchaseControl || disabledPurchaseControl || null;
 const purchaseControlExact = Boolean(
   chosenPurchaseControl
-  && (
-    chosenPurchaseControl.associationStrength === 2
-    || (
-      chosenPurchaseControl.associationStrength === 1
-      && chosenPurchaseControl.score >= 70
-    )
-  )
+  && chosenPurchaseControl.associationStrength >= 2
 );
 const purchaseY = chosenPurchaseControl?.y || startY + 1250;
 
+const purchaseScope = (() => {
+  if (!chosenPurchaseControl?.element) return null;
+  let current = chosenPurchaseControl.element.parentElement;
+  let fallback = current;
+  for (let depth = 0; current && depth < 8; depth += 1, current = current.parentElement) {
+    if (!visible(current) || hasExcludedAncestor(current)) continue;
+    const text = normalize(current.textContent);
+    if (!text || text.length > 9000) continue;
+    fallback = current;
+    const token = elementToken(current);
+    const hasPrice = /\$\s*\d/.test(text)
+      || current.querySelector?.(
+        '[data-testid*="price" i], [data-automation-id*="price" i], [itemprop="price"]'
+      );
+    const hasPurchaseContext = /buy.?box|purchase|fulfillment|add.?to.?cart|shipping|pickup|delivery/.test(
+      lower(token + ' ' + text.slice(0, 1200))
+    );
+    if (hasPrice && hasPurchaseContext) return current;
+  }
+  return fallback;
+})();
+const inPurchaseScope = element => {
+  if (!element || !visible(element) || hasExcludedAncestor(element)) return false;
+  if (insideAlternateCondition(element) || insideUnselectedVariant(element)) return false;
+  const y = pageY(element);
+  if (!chosenPurchaseControl) {
+    return y >= startY - 150 && y <= startY + 1800;
+  }
+  if (
+    purchaseScope?.contains(element)
+    && Math.abs(y - purchaseY) <= 700
+  ) return true;
+  return Math.abs(y - purchaseY) <= 420;
+};
+const purchaseScopeVerified = Boolean(
+  purchaseControlExact
+  && purchaseScope
+  && !hasExcludedAncestor(purchaseScope)
+);
+
 const priceElements = [...main.querySelectorAll(
-  '[itemprop="price"], [data-testid*="price" i], [data-automation-id*="price" i], [aria-label*="$"], meta[itemprop="price"]'
+  '[itemprop="price"], [data-testid*="price" i], [data-automation-id*="price" i], [aria-label*="$"]'
 )]
-  .filter(element => element.tagName === 'META' || inPrimaryBand(element))
-  .filter(element => element.tagName === 'META' || belongsToRequestedItem(element))
-  .filter(element => element.tagName === 'META' || !insideAlternateCondition(element))
+  .filter(inPrimaryBand)
+  .filter(inPurchaseScope)
   .map(element => {
     const text = normalize(
       element.getAttribute('content')
       || element.getAttribute('aria-label')
       || element.textContent
     );
-    const token = elementToken(element);
-    const y = element.tagName === 'META' ? startY : pageY(element);
+    const token = lower(
+      elementToken(element)
+      + ' '
+      + normalize(element.getAttribute('itemprop'))
+    );
+    const context = normalize(element.parentElement?.textContent || '').slice(0, 700);
+    const directCombined = lower(text + ' ' + token);
+    const combined = lower(directCombined + ' ' + context);
+    const y = pageY(element);
+    const hasCurrentPriceCue = /current price|price-current|price-characteristic|product-price|price when purchased online|\bnow\s*\$/.test(combined);
+    const rejected = (
+      !hasCurrentPriceCue
+      && /was price|list price|\bwas\s*\$|unit price|strike|comparison|savings|save \$|discount/.test(directCombined)
+    ) || /per month|monthly|affirm|klarna|afterpay|protection plan/.test(directCombined);
+    const highConfidence = !rejected && (
+      hasCurrentPriceCue
+      || (
+        /^\$\s*\d[\d,]*(?:\.\d{1,2})?$/.test(text)
+        && purchaseScopeVerified
+      )
+    );
     let score = 0;
-    if (/current price|product price|price-current|price-characteristic/.test(lower(text + ' ' + token))) score += 80;
-    if (/was price|list price|strike|comparison/.test(lower(text + ' ' + token))) score -= 100;
+    if (highConfidence) score += 120;
+    if (/current price|product price|price-current|price-characteristic/.test(combined)) score += 80;
+    if (rejected) score -= 300;
     if (/\$\s*\d/.test(text)) score += 40;
     if (y <= purchaseY + 250) score += 20;
     score -= Math.min(60, Math.abs(purchaseY - y) / 40);
-    return { text, token, y, score };
+    return { text, token, context, y, score, highConfidence, rejected };
   })
   .filter(item => /\$\s*\d/.test(item.text) || /^\d+(?:\.\d{1,2})?$/.test(item.text))
+  .filter(item => !item.rejected)
   .sort((a, b) => b.score - a.score);
-const priceText = priceElements[0]?.text || '';
+const highConfidencePrices = priceElements.filter(item => item.highConfidence);
+const normalizedPriceValues = highConfidencePrices
+  .map(item => {
+    const match = item.text.replace(/,/g, '').match(/\$\s*(\d+(?:\.\d{1,2})?)/);
+    return match ? Number(match[1]).toFixed(2) : '';
+  })
+  .filter(Boolean);
+const priceConflict = new Set(normalizedPriceValues).size > 1;
+const priceText = priceConflict ? '' : (highConfidencePrices[0]?.text || '');
+const priceExact = Boolean(
+  priceText
+  && purchaseControlExact
+  && highConfidencePrices[0]?.highConfidence
+);
 
 const atomic = [...main.querySelectorAll('span, p, div, li, button, label')]
   .filter(inPrimaryBand)
-  .filter(belongsToRequestedItem)
   .map(element => ({
     element,
     text: directText(element) || (element.children.length === 0 ? normalize(element.textContent) : ''),
@@ -1173,27 +1428,62 @@ const lowPattern = /low stock|limited stock|few left|only\s+\d+\s+(?:left|remain
 const lowStockTexts = atomic
   .filter(item => lowPattern.test(item.text))
   .filter(item => !insideAlternateCondition(item.element))
+  .filter(item => inPurchaseScope(item.element))
   .filter(item => Math.abs(item.y - purchaseY) <= 850)
   .sort((a, b) => Math.abs(a.y - purchaseY) - Math.abs(b.y - purchaseY))
   .map(item => item.text)
   .filter((value, index, array) => array.indexOf(value) === index)
   .slice(0, 8);
+const lowStockExact = Boolean(
+  purchaseControlExact
+  && lowStockTexts.length
+);
 
 const selectedElements = [...main.querySelectorAll(
   '[aria-checked="true"], [aria-selected="true"], [data-selected="true"], [data-state="selected"]'
 )]
   .filter(inPrimaryBand)
-  .filter(belongsToRequestedItem);
+  .filter(element => {
+    const label = normalize(
+      element.getAttribute('aria-label')
+      || element.textContent
+    );
+    return itemAssociation(element, label).strength >= 2
+      || inPurchaseScope(element);
+  });
 const selectedOptionTexts = selectedElements
   .map(element => normalize(element.getAttribute('aria-label') || element.textContent))
   .filter(Boolean)
   .slice(0, 20);
 const selectedOptionOos = selectedOptionTexts.some(text => /out of stock|sold out|unavailable/i.test(text));
+const selectedOptionExact = Boolean(
+  selectedOptionOos
+  && selectedElements.some(element => {
+    const label = normalize(
+      element.getAttribute('aria-label')
+      || element.textContent
+    );
+    return itemAssociation(element, label).strength >= 2
+      || inPurchaseScope(element);
+  })
+);
 
 const oosPattern = /^(?:out of stock|sold out|currently unavailable|item unavailable|this item is unavailable|no longer available|not available)$/i;
+const exactOosRegion = [...main.querySelectorAll(
+  '[aria-label*="out of stock" i], [data-testid*="out-of-stock" i], [data-automation-id*="out-of-stock" i]'
+)]
+  .filter(inPrimaryBand)
+  .filter(element => !hasExcludedAncestor(element))
+  .some(element => /out of stock details|sorry,? this item is out of stock/i.test(
+    normalize(
+      element.getAttribute('aria-label')
+      || element.textContent
+    )
+  ));
 const productOosTexts = atomic
   .filter(item => oosPattern.test(item.text))
   .filter(item => !insideAlternateCondition(item.element))
+  .filter(item => inPurchaseScope(item.element))
   .filter(item => {
     const ancestorText = lower(item.element.parentElement?.textContent || '');
     return !/shipping|pickup|delivery/.test(ancestorText.slice(0, 260));
@@ -1202,11 +1492,20 @@ const productOosTexts = atomic
   .map(item => item.text)
   .filter((value, index, array) => array.indexOf(value) === index)
   .slice(0, 8);
+const productOosExact = Boolean(
+  exactOosRegion
+  || productOosTexts.length
+  && (
+    purchaseScopeVerified
+    || productOosTexts.some(text => /this item|item unavailable|no longer available/i.test(text))
+  )
+);
 
 const fulfillment = {};
 for (const method of ['shipping', 'pickup', 'delivery']) {
   const labels = [...main.querySelectorAll('span, p, div, h3, h4, button')]
     .filter(inPrimaryBand)
+    .filter(inPurchaseScope)
     .filter(element => lower(directText(element) || element.textContent) === method);
   let best = null;
   for (const label of labels) {
@@ -1242,15 +1541,18 @@ const allFulfillmentUnavailable = fulfillmentValues.length >= 2
   && unavailableMethodCount === fulfillmentValues.length
   && availableMethodCount === 0;
 
-const productOos = productOosTexts.length > 0;
+const productOos = Boolean(
+  exactOosRegion
+  || (productOosTexts.length > 0 && productOosExact)
+);
 const enabledPurchase = Boolean(enabledPurchaseControl && purchaseControlExact);
 
 const normalizeAvailability = value => normalize(value).replace(/^https?:\/\/schema\.org\//i, '');
 const jsonLdExactCandidates = [];
-const visitJson = (value, attachedExactProduct = false, depth = 0) => {
+const visitJson = (value, depth = 0) => {
   if (!value || depth > 12) return;
   if (Array.isArray(value)) {
-    for (const child of value.slice(0, 100)) visitJson(child, attachedExactProduct, depth + 1);
+    for (const child of value.slice(0, 100)) visitJson(child, depth + 1);
     return;
   }
   if (typeof value !== 'object') return;
@@ -1263,9 +1565,10 @@ const visitJson = (value, attachedExactProduct = false, depth = 0) => {
     || objectUrl.includes('/' + requestedItemId)
     || objectUrl.endsWith(requestedItemId);
   const typeText = normalize(value['@type']).toLowerCase();
-  const exactProduct = attachedExactProduct || (exact && typeText.includes('product'));
 
-  if (exact || exactProduct) {
+  if (exact) {
+    // Read only the exact object's immediate offers. Do not carry the exact
+    // product identity into nested variant/recommendation objects.
     const offers = Array.isArray(value.offers) ? value.offers : (value.offers ? [value.offers] : []);
     if (typeText.includes('offer')) offers.push(value);
     if (!offers.length && value.availability) offers.push(value);
@@ -1281,7 +1584,7 @@ const visitJson = (value, attachedExactProduct = false, depth = 0) => {
   }
 
   for (const child of Object.values(value).slice(0, 200)) {
-    visitJson(child, exactProduct, depth + 1);
+    visitJson(child, depth + 1);
   }
 };
 for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
@@ -1334,14 +1637,27 @@ return {
     y: chosenPurchaseControl.y,
     associatedItemIds: chosenPurchaseControl.associatedItemIds,
     associationStrength: chosenPurchaseControl.associationStrength,
+    associationSource: chosenPurchaseControl.associationSource,
     score: chosenPurchaseControl.score,
   } : {},
   priceText,
-  priceCandidates: priceElements.slice(0, 6).map(item => ({ text: item.text, token: item.token, y: item.y, score: item.score })),
+  priceExact,
+  priceConflict,
+  priceCandidates: priceElements.slice(0, 6).map(item => ({
+    text: item.text,
+    token: item.token,
+    context: item.context,
+    y: item.y,
+    score: item.score,
+    highConfidence: item.highConfidence,
+  })),
   lowStockTexts,
+  lowStockExact,
   selectedOptionTexts,
   selectedOptionOos,
+  selectedOptionExact,
   productOos,
+  productOosExact,
   productOosTexts,
   fulfillment,
   allFulfillmentUnavailable,
