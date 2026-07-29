@@ -31,8 +31,12 @@ from selenium.common.exceptions import (
 )
 from selenium.webdriver.support.ui import WebDriverWait
 
+from core.result_policy import apply_stock_policy
+from core.scrape_result import ScrapeResult, StockState, VerificationStatus
+from core.scraper_diagnostics import result_to_legacy_tuple
 
-WALMART_SCRAPER_VERSION = "2026.07.25.exact-offer-binding-v10.0.0"
+
+WALMART_SCRAPER_VERSION = "2026.07.28.scrapling-hybrid-v10.2.0"
 
 _STOCK_IN = "In Stock"
 _STOCK_OOS = "OOS"
@@ -252,12 +256,21 @@ class WalmartScraper:
                     resolved.reason,
                     driver=driver,
                 )
-                return self._error(
-                    url,
-                    resolved.reason,
-                    title=resolved.title or "Walmart item",
-                    evidence=resolved.evidence,
-                    stock=resolved.stock,
+                review_result = self._resolved_to_result(
+                    url=url,
+                    target_variation=target_variation,
+                    resolved=resolved,
+                )
+                return self._result_to_public_tuple(
+                    review_result,
+                    target_variation=target_variation,
+                    logs=[
+                        (
+                            resolved.reason or "Walmart result requires review.",
+                            "warning",
+                            url,
+                        )
+                    ],
                 )
 
             fixed_zip = str(self.config.get("fixed_zip_code") or "").strip()
@@ -274,24 +287,30 @@ class WalmartScraper:
                     reason,
                     driver=driver,
                 )
-                return self._error(
-                    url,
-                    reason,
-                    title=resolved.title,
-                    evidence=resolved.evidence,
+                location_result = self._resolved_to_result(
+                    url=url,
+                    target_variation=target_variation,
+                    resolved=_ResolvedSnapshot(
+                        status="Error",
+                        stock=_STOCK_UNKNOWN,
+                        price="",
+                        title=resolved.title,
+                        item_id=resolved.item_id or requested_item_id,
+                        reason=reason,
+                        evidence=resolved.evidence,
+                    ),
+                )
+                return self._result_to_public_tuple(
+                    location_result,
+                    target_variation=target_variation,
+                    logs=[(reason, "warning", url)],
                 )
 
-            variants = [
-                {
-                    "label": target_variation or "Exact linked item",
-                    "price": resolved.price,
-                    "stock": resolved.stock,
-                    "item_id": resolved.item_id,
-                    "source": "walmart_exact_selected_offer_v9_1",
-                    "evidence": resolved.evidence,
-                }
-            ]
-
+            result = self._resolved_to_result(
+                url=url,
+                target_variation=target_variation,
+                resolved=resolved,
+            )
             logs: list[tuple[str, str, str]] = [
                 (
                     (
@@ -304,17 +323,12 @@ class WalmartScraper:
                     url,
                 )
             ]
-
             if resolved.reason:
                 logs.append((resolved.reason, "info", url))
-
-            return (
-                "Success",
-                resolved.price,
-                resolved.stock,
-                resolved.title,
-                variants,
-                logs,
+            return self._result_to_public_tuple(
+                result,
+                target_variation=target_variation,
+                logs=logs,
             )
         finally:
             if created_handle:
@@ -951,6 +965,377 @@ class WalmartScraper:
             return ""
         return Counter(values).most_common(1)[0][0]
 
+    @staticmethod
+    def _stock_state_from_text(stock: Any, reason: Any = "") -> tuple[StockState, Optional[int]]:
+        stock_text = str(stock or "").strip()
+        combined = f"{stock_text} {str(reason or '')}".strip()
+        quantity_match = _QUANTITY_RE.search(combined)
+        if quantity_match:
+            quantity = int(quantity_match.group(1) or quantity_match.group(2))
+            return StockState.QUANTITY_REMAINING, quantity
+        if _LIMITED_STOCK_RE.search(combined):
+            return StockState.LIMITED_STOCK, None
+        if _LOW_STOCK_RE.search(combined):
+            return StockState.LOW_STOCK, None
+        normalized = stock_text.lower()
+        if normalized in {"oos", "out of stock", "out-of-stock"}:
+            return StockState.OOS, None
+        if normalized in {"in stock", "instock", "available"}:
+            return StockState.IN_STOCK, None
+        return StockState.UNKNOWN, None
+
+    @staticmethod
+    def _normalize_match_tokens(value: Any) -> set[str]:
+        text = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())
+        ignored = {
+            "add", "to", "cart", "buy", "now", "the", "a", "an", "for",
+            "with", "and", "of", "in", "on", "item", "product",
+        }
+        return {
+            token
+            for token in text.split()
+            if len(token) >= 2 and token not in ignored
+        }
+
+    @classmethod
+    def _cta_matches_title(cls, title: Any, cart_label: Any) -> bool:
+        title_tokens = cls._normalize_match_tokens(title)
+        cta_tokens = cls._normalize_match_tokens(cart_label)
+        if not title_tokens or not cta_tokens:
+            return False
+        ordered_title_tokens = [
+            token
+            for token in re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).split()
+            if token in title_tokens
+        ]
+        identity_anchor = ordered_title_tokens[0] if ordered_title_tokens else ""
+        if identity_anchor and identity_anchor not in cta_tokens:
+            return False
+        shared = title_tokens & cta_tokens
+        # Require enough exact product-language overlap to reject recommendation
+        # cards that happen to share a size or one generic product word.
+        required = max(2, min(5, (len(title_tokens) + 2) // 3))
+        return len(shared) >= required and len(shared) / max(1, len(title_tokens)) >= 0.35
+
+    @staticmethod
+    def _fulfillment_texts(dom: dict[str, Any]) -> list[str]:
+        fulfillment = dom.get("fulfillment") or {}
+        if not isinstance(fulfillment, dict):
+            return []
+        return [
+            str(value or "").strip()
+            for value in fulfillment.values()
+            if str(value or "").strip()
+        ]
+
+    @staticmethod
+    def _is_unavailable_fulfillment(text: str) -> bool:
+        lowered = str(text or "").lower()
+        return any(
+            token in lowered
+            for token in (
+                "not available", "unavailable", "out of stock", "sold out",
+                "not eligible", "cannot be shipped",
+            )
+        )
+
+    @classmethod
+    def _all_fulfillment_unavailable(cls, dom: dict[str, Any]) -> bool:
+        values = cls._fulfillment_texts(dom)
+        return bool(values) and all(cls._is_unavailable_fulfillment(value) for value in values)
+
+    @classmethod
+    def _has_available_shipping(cls, dom: dict[str, Any]) -> bool:
+        fulfillment = dom.get("fulfillment") or {}
+        if not isinstance(fulfillment, dict):
+            return False
+        shipping = str(fulfillment.get("shipping") or "").strip()
+        if not shipping or cls._is_unavailable_fulfillment(shipping):
+            return False
+        lowered = shipping.lower()
+        return any(
+            token in lowered
+            for token in ("arrives", "shipping", "delivery date", "free")
+        )
+
+    @staticmethod
+    def _exact_oos_text_present(dom: dict[str, Any]) -> bool:
+        texts = dom.get("exactStockTexts") or []
+        if not isinstance(texts, (list, tuple)):
+            texts = [texts]
+        return any(
+            re.search(r"\bout\s+of\s+stock\b|\bsold\s+out\b", str(item or ""), re.I)
+            for item in texts
+        )
+
+    @classmethod
+    def _payload_to_result(
+        cls,
+        url: str,
+        target_variation: str,
+        payload: dict[str, Any],
+        logs: list[tuple[str, str, str]],
+    ) -> ScrapeResult:
+        """Convert old/runtime payloads into the one structured Walmart contract.
+
+        This compatibility bridge is intentionally conservative. It keeps a
+        trustworthy price inside ``ScrapeResult`` for verification, but marks
+        Walmart as stock-only so the engine never proposes a Walmart price
+        change to the sheet.
+        """
+        data = payload if isinstance(payload, dict) else {}
+        evidence = data.get("evidence") or {}
+        evidence = evidence if isinstance(evidence, dict) else {}
+        dom = evidence.get("dom") or {}
+        dom = dom if isinstance(dom, dict) else {}
+        title = str(data.get("title") or dom.get("title") or "Walmart item").strip()
+        item_id = str(data.get("itemId") or cls._extract_item_id(url) or "").strip()
+        final_url = str(evidence.get("pageUrl") or url or "").strip()
+        reason = str(data.get("reason") or "").strip()
+        status_text = str(data.get("status") or "Error").strip().lower()
+        raw_stock = str(data.get("stock") or "Unable to Verify").strip()
+        raw_price = data.get("price")
+        if raw_price in (None, ""):
+            raw_price = dom.get("priceText")
+        parsed_price = ScrapeResult.parse_price(raw_price)
+
+        metadata = {
+            "walmart_stock_only_mode": True,
+            "scraper_version": WALMART_SCRAPER_VERSION,
+            "runtime_version": str(evidence.get("runtimeVersion") or ""),
+            "browser_mode": str(evidence.get("browserMode") or ""),
+            "legacy_payload": data,
+            "logs_received": len(logs or []),
+        }
+
+        if status_text != "success":
+            lowered_reason = reason.lower()
+            verification = (
+                VerificationStatus.BLOCKED
+                if any(token in lowered_reason for token in ("captcha", "robot", "human verification"))
+                else VerificationStatus.ERROR
+            )
+            result = ScrapeResult(
+                supplier="WAL",
+                url=url,
+                verification=verification,
+                observed_stock=StockState.UNKNOWN,
+                title=title,
+                item_id=item_id,
+                final_url=final_url,
+                variant=target_variation,
+                error_message=reason or "The Walmart page could not be verified.",
+                policy_reason=reason or "The Walmart page could not be verified.",
+                metadata=metadata,
+            )
+            result.add_evidence(
+                source="walmart_runtime",
+                field_name="status",
+                value=data.get("status") or "Error",
+                item_id=item_id or None,
+                confidence=1.0,
+                details=evidence,
+            )
+            return result
+
+        state, quantity = cls._stock_state_from_text(raw_stock, reason)
+        fulfillment_text = " ".join(cls._fulfillment_texts(dom))
+        fulfillment_state, fulfillment_quantity = cls._stock_state_from_text(
+            fulfillment_text,
+            reason,
+        )
+        if fulfillment_state in {
+            StockState.LOW_STOCK,
+            StockState.LIMITED_STOCK,
+            StockState.QUANTITY_REMAINING,
+        }:
+            state = fulfillment_state
+            quantity = fulfillment_quantity
+
+        cart_label = str(dom.get("cartControlLabel") or "").strip()
+        enabled_add = bool(dom.get("enabledAdd") or dom.get("buyNowEnabled"))
+        cta_matches = cls._cta_matches_title(title, cart_label) if cart_label else False
+        exact_oos = cls._exact_oos_text_present(dom)
+        all_unavailable = cls._all_fulfillment_unavailable(dom)
+        shipping_available = cls._has_available_shipping(dom)
+
+        # Explicit low/limited/quantity rules always become verified sheet OOS.
+        if state in {
+            StockState.LOW_STOCK,
+            StockState.LIMITED_STOCK,
+            StockState.QUANTITY_REMAINING,
+        }:
+            verification = VerificationStatus.VERIFIED
+        elif state == StockState.OOS:
+            verification = VerificationStatus.VERIFIED
+        elif cart_label and not cta_matches:
+            if exact_oos and all_unavailable:
+                state = StockState.OOS
+                verification = VerificationStatus.VERIFIED
+                parsed_price = None
+                reason = reason or "Exact-item OOS evidence overrides a mismatched recommendation CTA."
+            else:
+                state = StockState.UNKNOWN
+                verification = VerificationStatus.CONFLICT
+                parsed_price = None
+                reason = (
+                    "The visible purchase control belongs to a different product and "
+                    "the exact linked item did not provide complete OOS evidence."
+                )
+        elif state == StockState.IN_STOCK or (enabled_add and cta_matches) or shipping_available:
+            state = StockState.IN_STOCK
+            if parsed_price is None:
+                verification = VerificationStatus.PARTIAL
+                reason = (
+                    "The exact linked item appears In Stock, but its current rendered "
+                    "price could not be verified."
+                )
+            else:
+                verification = VerificationStatus.VERIFIED
+        elif exact_oos and all_unavailable:
+            state = StockState.OOS
+            parsed_price = None
+            verification = VerificationStatus.VERIFIED
+        else:
+            state = StockState.UNKNOWN
+            parsed_price = None
+            verification = VerificationStatus.UNKNOWN
+            reason = reason or "The exact linked item did not provide a stable inventory decision."
+
+        result = ScrapeResult(
+            supplier="WAL",
+            url=url,
+            verification=verification,
+            observed_stock=state,
+            price=(
+                parsed_price
+                if state == StockState.IN_STOCK and verification == VerificationStatus.VERIFIED
+                else None
+            ),
+            quantity=quantity,
+            title=title,
+            item_id=item_id,
+            final_url=final_url,
+            variant=target_variation,
+            policy_reason=reason,
+            metadata=metadata,
+        )
+        result.add_evidence(
+            source="walmart_runtime",
+            field_name="payload",
+            value=raw_stock,
+            item_id=item_id or None,
+            confidence=1.0 if verification == VerificationStatus.VERIFIED else 0.5,
+            details={
+                "cart_label": cart_label,
+                "cta_matches_title": cta_matches,
+                "exact_oos": exact_oos,
+                "all_fulfillment_unavailable": all_unavailable,
+                "shipping_available": shipping_available,
+                "dom": dom,
+            },
+        )
+        return apply_stock_policy(result)
+
+    @classmethod
+    def _resolved_to_result(
+        cls,
+        *,
+        url: str,
+        target_variation: str,
+        resolved: _ResolvedSnapshot,
+    ) -> ScrapeResult:
+        state, quantity = cls._stock_state_from_text(resolved.stock, resolved.reason)
+        if resolved.status == "Success":
+            verification = VerificationStatus.VERIFIED
+        else:
+            reason_lower = str(resolved.reason or "").lower()
+            if resolved.stock == "Captcha" or any(
+                token in reason_lower for token in ("captcha", "robot verification", "human verification")
+            ):
+                verification = VerificationStatus.BLOCKED
+            elif any(
+                token in reason_lower
+                for token in (
+                    "conflicting", "different shopping location", "did not remain on the exact",
+                    "could not be bound", "multiple current prices", "inconclusive",
+                    "not provide enough stable", "only exact-item json-ld",
+                    "location-specific",
+                )
+            ):
+                verification = VerificationStatus.CONFLICT
+            else:
+                verification = VerificationStatus.ERROR
+
+        result = ScrapeResult(
+            supplier="WAL",
+            url=url,
+            verification=verification,
+            observed_stock=state,
+            price=(
+                ScrapeResult.parse_price(resolved.price)
+                if verification == VerificationStatus.VERIFIED and state == StockState.IN_STOCK
+                else None
+            ),
+            quantity=quantity,
+            title=resolved.title,
+            item_id=resolved.item_id,
+            final_url=str((resolved.evidence or {}).get("page_url") or url),
+            variant=target_variation,
+            policy_reason=resolved.reason,
+            error_message=(
+                resolved.reason
+                if verification in {VerificationStatus.ERROR, VerificationStatus.BLOCKED}
+                else ""
+            ),
+            metadata={
+                "walmart_stock_only_mode": True,
+                "scraper_version": WALMART_SCRAPER_VERSION,
+                "exact_offer_binding": True,
+                "raw_evidence": resolved.evidence,
+            },
+        )
+        result.add_evidence(
+            source="walmart_exact_offer",
+            field_name="resolved_snapshot",
+            value=resolved.stock,
+            item_id=resolved.item_id or None,
+            confidence=1.0 if verification == VerificationStatus.VERIFIED else 0.5,
+            details=resolved.evidence,
+        )
+        return apply_stock_policy(result)
+
+    @staticmethod
+    def _result_to_public_tuple(
+        result: ScrapeResult,
+        *,
+        target_variation: str = "",
+        logs: Optional[list[tuple[str, str, str]]] = None,
+    ) -> tuple[
+        str,
+        str,
+        str,
+        str,
+        list[dict[str, Any]],
+        list[tuple[str, str, str]],
+    ]:
+        legacy = result_to_legacy_tuple(
+            result,
+            target_variation=target_variation,
+            logs=logs,
+        )
+        status, _price, stock, title, variants, output_logs = legacy
+        # Walmart prices remain internal evidence only. The structured result
+        # keeps the verified price so the safety gate can validate In Stock,
+        # while the public tuple cannot trigger a sheet price update.
+        public_variants = []
+        for variant in variants:
+            item = dict(variant)
+            item["price"] = ""
+            item["source"] = "walmart_exact_offer_structured_v10_2"
+            public_variants.append(item)
+        return status, "", stock, title, public_variants, output_logs
+
     def _read_config(self) -> dict[str, Any]:
         defaults: dict[str, Any] = {
             "navigation_timeout_ms": 45000,
@@ -1043,8 +1428,9 @@ class WalmartScraper:
         except OSError:
             pass
 
-    @staticmethod
+    @classmethod
     def _error(
+        cls,
         url: str,
         message: str,
         *,
@@ -1060,7 +1446,6 @@ class WalmartScraper:
         list[tuple[str, str, str]],
     ]:
         safe_message = str(message or "Unable to verify Walmart item.").strip()
-
         try:
             project_root = Path(__file__).resolve().parents[1]
             log_path = project_root / "logs" / "walmart_runtime_errors.log"
@@ -1075,24 +1460,24 @@ class WalmartScraper:
         except OSError:
             pass
 
-        variants = [
-            {
-                "label": "Exact linked item",
-                "price": "",
-                "stock": stock,
-                "source": "walmart_exact_selected_offer_v9_1",
-                "evidence": evidence or {},
-                "reason": safe_message,
-            }
-        ]
-
-        return (
-            "Error",
-            "",
-            stock,
-            title,
-            variants,
-            [(safe_message, "error", url)],
+        resolved = _ResolvedSnapshot(
+            status="Error",
+            stock=stock,
+            price="",
+            title=title,
+            item_id=cls._extract_item_id(url),
+            reason=safe_message,
+            evidence=dict(evidence or {}) if isinstance(evidence, dict) else {"raw": evidence},
+        )
+        result = cls._resolved_to_result(
+            url=url,
+            target_variation="",
+            resolved=resolved,
+        )
+        return cls._result_to_public_tuple(
+            result,
+            target_variation="Exact linked item",
+            logs=[(safe_message, "error", url)],
         )
 
 

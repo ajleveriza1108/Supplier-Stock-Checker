@@ -44,6 +44,10 @@ class BraveMinimizedBackgroundTests(unittest.TestCase):
         manager.headless = False
         manager.driver = driver
         manager.browser_process = None
+        manager._browser_pid = None
+        manager._minimize_stop = threading.Event()
+        manager._minimize_thread = None
+        manager._native_minimize_browser_window = lambda: False
         manager.lock = threading.RLock()
         manager.operation_lock = threading.RLock()
         manager.get_driver = lambda: driver
@@ -95,6 +99,9 @@ class BraveMinimizedBackgroundTests(unittest.TestCase):
         manager._is_debugger_running = lambda: False
         manager._wait_for_debugger = lambda: None
         process = Mock()
+        process.pid = 12345
+        process.poll.return_value = None
+        manager._start_minimize_watchdog = lambda: None
 
         with (
             patch(

@@ -112,3 +112,12 @@ logs/walmart_evidence/
 scrapers/walmart_runtime/node_modules/
 
 .repair-backups/
+.phase-backups/
+README_INSTALL.txt
+WALMART_*_LINK_AUDIT.csv
+WALMART_LINK_AUDIT.md
+browser_profiles/walmart_scrapling/
+browser_profiles/scrapling/
+.scrapling/
+logs/walmart_debug/
+logs/walmart_runtime_errors.log

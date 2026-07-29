@@ -48,12 +48,14 @@ from core.config_manager import ConfigManager
 from core.engine import ScrapingEngine
 from core.sheets import GoogleSheetsManager
 from scrapers.browser import BraveDebugManager
+from scrapers.scrapling_browser import ScraplingBrowserManager
 from scrapers.collectionsetc import CollectionsEtcScraper
 from scrapers.harbor_freight import HarborFreightScraper
 from scrapers.lakeside import LakesideScraper
 from scrapers.menards import MenardsScraper
 from scrapers.sportsmans_guide import SportsmansGuideScraper
 from scrapers.walmart import WalmartScraper
+from scrapers.walmart_scrapling import WalmartScraplingScraper
 from scrapers.webstaurant import WebstaurantScraper
 from ui.log_color_policy import (
     LogSeverity,
@@ -88,20 +90,45 @@ class StockPriceCheckerApp(ctk.CTk):
         self.config_manager = ConfigManager()
         self.sheets_manager = GoogleSheetsManager()
         self.debug_bm = BraveDebugManager(port=9222)
-
+        initial_scrapling_headless = bool(
+            self.config_manager.get(
+                "scrapling_headless",
+                self.config_manager.get(
+                    "walmart_scrapling_headless",
+                    self.config_manager.get("headless", True),
+                ),
+            )
+        )
+        self.scrapling_bm = ScraplingBrowserManager(
+            project_root=os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            headless=initial_scrapling_headless,
+            logger_func=self._write_log,
+        )
+        self.walmart_scraper = WalmartScraplingScraper(
+            headless=initial_scrapling_headless,
+            logger_func=self._write_log,
+            selenium_fallback=None,
+        )
         self.scrapers = {
             "WEB": WebstaurantScraper(
-                browser_manager=self.debug_bm,
+                browser_manager=self.scrapling_bm.for_supplier("WEB"),
                 use_physical_browser=True,
             ),
-            "WAL": WalmartScraper(browser_manager=self.debug_bm),
+            "WAL": self.walmart_scraper,
             "SG": SportsmansGuideScraper(browser_manager=None),
-            "HF": HarborFreightScraper(browser_manager=self.debug_bm),
-            "MN": MenardsScraper(browser_manager=self.debug_bm),
-            "LS": LakesideScraper(browser_manager=self.debug_bm),
-            "CE": CollectionsEtcScraper(browser_manager=None),
+            "HF": HarborFreightScraper(
+                browser_manager=self.scrapling_bm.for_supplier("HF")
+            ),
+            "MN": MenardsScraper(
+                browser_manager=self.scrapling_bm.for_supplier("MN")
+            ),
+            "LS": LakesideScraper(
+                browser_manager=self.scrapling_bm.for_supplier("LS")
+            ),
+            "CE": CollectionsEtcScraper(
+                browser_manager=self.scrapling_bm.for_supplier("CE")
+            ),
         }
-
         self.engine = ScrapingEngine(
             self.sheets_manager,
             self.config_manager,
@@ -130,7 +157,7 @@ class StockPriceCheckerApp(ctk.CTk):
             value="Regular (Regex)"
         )
         self.headless_var = ctk.BooleanVar(
-            value=self.config_manager.get("headless", False)
+            value=initial_scrapling_headless
         )
         self.use_vpn_var = ctk.BooleanVar(
             value=self.config_manager.get("use_vpn", True)
@@ -186,6 +213,7 @@ class StockPriceCheckerApp(ctk.CTk):
                 "enable_ai": self.enable_ai_var.get(),
                 "ai_engine": self.ai_engine_var.get(),
                 "headless": self.headless_var.get(),
+                "scrapling_headless": self.headless_var.get(),
                 "use_vpn": self.use_vpn_var.get(),
                 "sg_debug": self.sg_debug_var.get(),
                 "scrape_web": self.scrape_web_var.get(),
@@ -213,6 +241,10 @@ class StockPriceCheckerApp(ctk.CTk):
                 if hasattr(self.engine, "cleanup_vpn"):
                     self.engine.cleanup_vpn()
 
+            if hasattr(self, "walmart_scraper") and self.walmart_scraper:
+                self.walmart_scraper.close()
+            if hasattr(self, "scrapling_bm") and self.scrapling_bm:
+                self.scrapling_bm.close()
             if hasattr(self, "debug_bm") and self.debug_bm:
                 self.debug_bm.quit()
         except Exception:
@@ -484,8 +516,9 @@ class StockPriceCheckerApp(ctk.CTk):
 
         self.headless_check = ctk.CTkCheckBox(
             self.settings_frame,
-            text="Headless Mode",
+            text="Scrapling Browser: Headless",
             variable=self.headless_var,
+            command=self._apply_scrapling_mode,
             checkbox_width=16,
             checkbox_height=16,
         )
@@ -1549,8 +1582,8 @@ class StockPriceCheckerApp(ctk.CTk):
             "error",
         )
         self._write_log(
-            "All threads pausing. Solve the CAPTCHA in the open Brave "
-            "window, then click 'Resume'.",
+            "All threads pausing. Click 'Solve CAPTCHA' to open the saved "
+            "supplier session, close it when finished, then click Resume.",
             "error",
         )
         self.set_paused_buttons()
@@ -1667,20 +1700,40 @@ class StockPriceCheckerApp(ctk.CTk):
         )
         self.start_check(retry_list=self.failed_urls)
 
-    def open_browser(self):
-        urls = self.captcha_urls or self.failed_urls
-        if urls:
-            webbrowser.open(urls[-1])
+    def _apply_scrapling_mode(self, save=True):
+        headless = bool(self.headless_var.get())
+        self.scrapling_bm.set_headless(headless)
+        self.walmart_scraper.set_headless(headless)
+        if save:
+            self.config_manager.save_config("scrapling_headless", headless)
+            self.config_manager.save_config("headless", headless)
             self._write_log(
-                f"Opened default browser for {urls[-1]}",
+                "Scrapling mode changed to "
+                + ("Headless (hidden)." if headless else "Physical browser (visible).")
+                + " Applies to every supplier except Sportsman's Guide.",
                 "info",
             )
 
-        self._write_log(
-            "Fix the CAPTCHA in the automated browser window if it's "
-            "still open, then click Resume.",
-            "error",
-        )
+    def open_browser(self):
+        urls = self.captcha_urls or self.failed_urls
+        target_url = urls[-1] if urls else "https://www.walmart.com/"
+        lowered = target_url.lower()
+        if "sportsmansguide.com" in lowered:
+            webbrowser.open(target_url)
+            self._write_log(
+                "Sportsman's Guide keeps its existing browser path. Complete "
+                "the verification there, then click Resume.",
+                "warning",
+            )
+            return
+        opened, message = self.scrapling_bm.open_manual_verification(target_url)
+        self._write_log(message, "info" if opened else "warning")
+        if opened:
+            self._write_log(
+                "Solve the CAPTCHA or sign in, close the visible Scrapling "
+                "window, then click Resume.",
+                "warning",
+            )
 
     def toggle_schedule(self):
         if self.is_scheduling:

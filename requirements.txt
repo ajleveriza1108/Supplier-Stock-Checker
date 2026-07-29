@@ -9,3 +9,4 @@ plyer
 lxml
 customtkinter
 playwright
+scrapling[fetchers]==0.4.12

@@ -1,0 +1,20 @@
+{
+  "version": "2026.07.28.scrapling-all-suppliers-v10.3.0",
+  "headless": true,
+  "locale": "en-US",
+  "solve_cloudflare": true,
+  "manual_timeout_seconds": 300,
+  "wait_ms": 0,
+  "scroll_settle_seconds": 0.8,
+  "excluded_suppliers": [
+    "SG"
+  ],
+  "profiles": {
+    "WAL": "browser_profiles/walmart_scrapling",
+    "WEB": "browser_profiles/scrapling/web",
+    "HF": "browser_profiles/scrapling/hf",
+    "MN": "browser_profiles/scrapling/mn",
+    "LS": "browser_profiles/scrapling/ls",
+    "CE": "browser_profiles/scrapling/ce"
+  }
+}

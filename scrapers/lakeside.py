@@ -52,6 +52,12 @@ class LakesideScraper(BaseScraper):
                 self.log(f"Lakeside → Loading {url}", "info")
 
             driver.get(url)
+            if getattr(driver, "blocked_reason", ""):
+                logs.append(("Lakeside: Scrapling verification/CAPTCHA detected; no sheet change.", "error", url))
+                return "Error", "", "Captcha", "Blocked by Lakeside", [], logs
+            if getattr(driver, "fetch_error", "") and not getattr(driver, "page_source", ""):
+                logs.append((f"Lakeside: Scrapling fetch failed: {driver.fetch_error}", "error", url))
+                return "Error", "", "Unable to Verify", "Lakeside fetch error", [], logs
             time.sleep(random.uniform(3.0, 6.0))
 
             try:

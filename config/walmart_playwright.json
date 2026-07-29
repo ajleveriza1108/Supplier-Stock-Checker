@@ -5,5 +5,13 @@
   "max_navigation_attempts": 2,
   "fixed_zip_code": "",
   "save_debug_evidence": true,
-  "screenshots_on_error": true
+  "screenshots_on_error": true,
+  "browser_engine": "scrapling",
+  "scrapling_headless": true,
+  "scrapling_profile_directory": "browser_profiles/walmart_scrapling",
+  "scrapling_solve_cloudflare": true,
+  "scrapling_manual_timeout_seconds": 300,
+  "scrapling_max_snapshots": 6,
+  "scrapling_fallback_to_selenium": false,
+  "scrapling_locale": "en-US"
 }

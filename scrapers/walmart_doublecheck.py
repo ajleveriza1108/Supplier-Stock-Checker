@@ -1,20 +1,9 @@
-"""Compatibility wrapper for the Walmart v8.2 Node/Brave scraper.
-
-The engine historically replaces the configured Walmart scraper with
-``WalmartDoubleCheckScraper``.  Walmart v8 uses a Node/Brave CDP runtime and
-already performs exact-item collection and final Python reconciliation, so the
-wrapper must not call the removed legacy ``scrape_structured`` implementation.
-"""
-
+"""Compatibility wrapper for the unified Walmart exact-item scraper."""
 from __future__ import annotations
-
 from scrapers.walmart import WalmartScraper
 
-
-WALMART_DOUBLECHECK_VERSION = "2026.07.16.structured-bridge-v8.2"
-
+WALMART_DOUBLECHECK_VERSION = "2026.07.25.exact-offer-structured-v10.1.0"
 
 class WalmartDoubleCheckScraper(WalmartScraper):
-    """Backward-compatible class name using the v8.2 implementation."""
-
+    """Backward-compatible class name using the unified implementation."""
     pass

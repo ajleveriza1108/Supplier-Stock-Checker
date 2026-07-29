@@ -113,6 +113,12 @@ class HarborFreightScraper(BaseScraper):
         try:
             driver.set_page_load_timeout(40)
             driver.get(url)
+            if getattr(driver, "blocked_reason", ""):
+                logs.append(("HF: Scrapling verification/CAPTCHA detected; no sheet change.", "error", url))
+                return "Error", "", "Captcha", "Blocked by Harbor Freight", logs
+            if getattr(driver, "fetch_error", "") and not getattr(driver, "page_source", ""):
+                logs.append((f"HF: Scrapling fetch failed: {driver.fetch_error}", "error", url))
+                return "Error", "", "Unable to Verify", "Harbor Freight fetch error", logs
 
             try:
                 WebDriverWait(driver, 18).until(
